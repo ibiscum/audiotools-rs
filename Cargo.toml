@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "maintain_album_art/src",
+    "scale_cover/src"
+]

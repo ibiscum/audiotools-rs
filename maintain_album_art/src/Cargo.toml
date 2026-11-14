@@ -1,0 +1,16 @@
+[package]
+name = "maintain_album_art"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "maintain_album_art"
+path = "main.rs"
+
+[dependencies]
+env_logger = "0.11.8"
+id3 = "1.14.0"
+image = "0.25"
+log = "0.4.28"
+metaflac = "0.2.8"
+walkdir = "2.5.0"
