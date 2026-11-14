@@ -5,7 +5,7 @@ edition = "2024"
 
 [[bin]]
 name = "maintain_album_art"
-path = "main.rs"
+path = "src/main.rs"
 
 [dependencies]
 env_logger = "0.11.8"

@@ -5,14 +5,16 @@
 - [Install](#install)
 - [maintain_album_art](#maintain_album_art)
 - [scale_cover](#scale_cover)
+- [Last.fm scrobbler](#lastfm-scrobbler)
 
 ## Install
 
 From the workspace root, install each application by path:
 
 ```bash
-cargo install --path maintain_album_art/src
-cargo install --path scale_cover/src
+cargo install --path maintain-album-art
+cargo install --path scale-cover
+cargo install --path lastfm-scrobbler
 ```
 
 ## maintain_album_art
@@ -149,3 +151,7 @@ Optional: build first, then run the binary:
 cargo build -p scale_cover
 ./target/debug/scale_cover
 ```
+
+## Last.fm scrobbler
+
+See [docs/lastfm-scrobbler.md](docs/lastfm-scrobbler.md) for setup and service instructions.
