@@ -6,7 +6,10 @@ use std::path::Path;
 use image::imageops::FilterType;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use log::{debug, error, info, warn};
-use zune_jpeg::{JpegDecoder, zune_core::colorspace::ColorSpace};
+use zune_jpeg::{
+    JpegDecoder,
+    zune_core::{bytestream::ZCursor, colorspace::ColorSpace},
+};
 
 fn init_logging() {
     Builder::from_env(Env::default().default_filter_or("info"))
@@ -139,8 +142,8 @@ fn copy_file_atomically(source_path: &str, target_path: &str) -> Result<(), Stri
     if let Err(e) = std::fs::rename(&target_tmp_path, target_path) {
         remove_file_if_exists(&target_tmp_path, "temporary copied file");
         return Err(format!(
-            "replacing '{}' with '{}': {}",
-            target_path, target_tmp_path, e
+            "renaming '{}' to '{}': {}",
+            target_tmp_path, target_path, e
         ));
     }
 
@@ -170,7 +173,8 @@ fn validate_and_reencode_jpeg(
     let mut input_bytes = Vec::new();
     file.read_to_end(&mut input_bytes)?;
 
-    let mut decoder = JpegDecoder::new(&input_bytes);
+    let reader = ZCursor::new(input_bytes.as_slice());
+    let mut decoder = JpegDecoder::new(reader);
     let pixels = decoder.decode()?;
 
     let info = decoder
@@ -179,7 +183,7 @@ fn validate_and_reencode_jpeg(
     let width = info.width;
     let height = info.height;
     let colorspace = decoder
-        .get_output_colorspace()
+        .output_colorspace()
         .ok_or("Failed to detect JPEG colorspace during validation")?;
 
     if colorspace != ColorSpace::RGB {
