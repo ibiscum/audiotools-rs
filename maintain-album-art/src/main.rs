@@ -283,7 +283,7 @@ fn process_flac_file(
             } else {
                 stats.missing_art += 1;
                 stats.missing_front_cover_1000 += 1;
-                warn!("[MISSING] {}", file_name);
+                error!("[MISSING] {}", file_name);
             }
         }
         Err(err) => {
@@ -361,7 +361,7 @@ fn process_mp3_file(
             } else {
                 stats.missing_art += 1;
                 stats.missing_front_cover_1000 += 1;
-                warn!("[MISSING] {}", file_name);
+                error!("[MISSING] {}", file_name);
             }
         }
         Err(err) => {
@@ -378,7 +378,7 @@ fn print_final_summary(
     dir_audits: &BTreeMap<PathBuf, DirAudit>,
     skip_complete_in_summary: bool,
 ) {
-    info!("\n=== Summary ===");
+    info!("=== Summary ===");
     info!("Total audio files found: {}", stats.total_tracks);
     info!("Files with cover art:  {}", stats.with_art);
     info!("Files missing art:     {}", stats.missing_art);
@@ -393,7 +393,7 @@ fn print_final_summary(
         stats.missing_front_cover_1000
     );
 
-    info!("\n=== Directory Summary ===");
+    info!("=== Directory Summary ===");
     let mut shown_dirs = 0;
     for (path, audit) in dir_audits {
         if !audit.has_audio_files {
@@ -410,30 +410,38 @@ fn print_final_summary(
         }
 
         shown_dirs += 1;
-        info!("{}", path.display());
+        let display_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match env::current_dir() {
+                Ok(cwd) => cwd.join(path),
+                Err(_) => path.to_path_buf(),
+            }
+        };
+        info!("directory: {}", display_path.display());
         info!(
-            "  status: {}",
+            "status: {}",
             if complete_ok { "COMPLETE OK" } else { "INCOMPLETE" }
         );
         info!(
-            "  front.jpg 1000x1000: {}",
+            "front.jpg 1000x1000: {}",
             if audit.has_front_jpg_1000 { "yes" } else { "no" }
         );
         info!(
-            "  folder.jpg >=1000x1000: {}",
+            "folder.jpg >=1000x1000: {}",
             if audit.has_folder_jpg_1000 { "yes" } else { "no" }
         );
         let missing_front_cover_1000 = audit.total_tracks - audit.tracks_with_front_cover_1000;
         if skip_complete_in_summary {
             if missing_front_cover_1000 > 0 {
                 info!(
-                    "  tracks without FRONT 1000x1000: {}",
+                    "tracks without FRONT 1000x1000: {}",
                     missing_front_cover_1000
                 );
             }
         } else {
             info!(
-                "  tracks with FRONT 1000x1000: {}/{}",
+                "tracks with FRONT 1000x1000: {}/{}",
                 audit.tracks_with_front_cover_1000, audit.total_tracks
             );
         }

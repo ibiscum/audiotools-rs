@@ -3,9 +3,9 @@
 ## Table of Contents
 
 - [Install](#install)
-- [maintain_album_art](#maintain_album_art)
-- [scale_cover](#scale_cover)
-- [Last.fm scrobbler](#lastfm-scrobbler)
+- [maintain-album-art](#maintain-album-art)
+- [scale-cover](#scale-cover)
+- [lastfm-scrobbler](#lastfm-scrobbler)
 
 ## Install
 
@@ -17,9 +17,9 @@ cargo install --path scale-cover
 cargo install --path lastfm-scrobbler
 ```
 
-## maintain_album_art
+## maintain-album-art
 
-`maintain_album_art` scans a directory tree for `.flac` and `.mp3` files and reports whether each file contains embedded album art in its metadata.
+`maintain-album-art` scans a directory tree for `.flac` and `.mp3` files and reports whether each file contains embedded album art in its metadata.
 
 See [docs/maintain-album-art.md](docs/maintain-album-art.md) for full usage
 and audit behavior details.
@@ -60,19 +60,19 @@ and audit behavior details.
 From the workspace root:
 
 ```bash
-cargo run -p maintain_album_art -- <directory-to-scan>
+cargo run -p maintain-album-art -- <directory-to-scan>
 ```
 
 Example:
 
 ```bash
-cargo run -p maintain_album_art -- ~/Music
+cargo run -p maintain-album-art -- ~/Music
 ```
 
-Quick help (same as `maintain_album_art --help`):
+Quick help (same as `maintain-album-art --help`):
 
 ```text
-Usage: maintain_album_art [--skip-complete] <directory-to-scan>
+Usage: maintain-album-art [--skip-complete] <directory-to-scan>
 
 Options:
   --skip-complete    Omit fully complete directories and suppress OK track lines/counts from summary output
@@ -82,26 +82,26 @@ Logging is standardized and written to stdout with levels (`INFO`, `WARN`, `ERRO
 Use `RUST_LOG` to control verbosity, for example:
 
 ```bash
-RUST_LOG=debug cargo run -p maintain_album_art -- ~/Music
-RUST_LOG=trace cargo run -p maintain_album_art -- ~/Music
+RUST_LOG=debug cargo run -p maintain-album-art -- ~/Music
+RUST_LOG=trace cargo run -p maintain-album-art -- ~/Music
 ```
 
 Skip complete directories in directory summary:
 
 ```bash
-cargo run -p maintain_album_art -- --skip-complete ~/Music
+cargo run -p maintain-album-art -- --skip-complete ~/Music
 ```
 
 Optional: build first, then run the binary:
 
 ```bash
-cargo build -p maintain_album_art
-./target/debug/maintain_album_art ~/Music
+cargo build -p maintain-album-art
+./target/debug/maintain-album-art ~/Music
 ```
 
-## scale_cover
+## scale-cover
 
-`scale_cover` uses `folder.jpg` as input origin for every run. It validates and normalizes `folder.jpg`, copies the cleaned `folder.jpg` to `front.jpg`, then scales `front.jpg` to exactly `1000x1000`.
+`scale-cover` uses `folder.jpg` as input origin for every run. It validates and normalizes `folder.jpg`, copies the cleaned `folder.jpg` to `front.jpg`, then scales `front.jpg` to exactly `1000x1000`.
 
 See [docs/scale-cover.md](docs/scale-cover.md) for full behavior and failure
 conditions.
@@ -130,7 +130,7 @@ conditions.
 
 ```mermaid
 sequenceDiagram
-    participant Main as scale_cover (main)
+    participant Main as scale-cover (main)
     participant Front as front.jpg
     participant Folder as folder.jpg
 
@@ -148,16 +148,16 @@ sequenceDiagram
 From the workspace root (with `folder.jpg` in your current directory):
 
 ```bash
-cargo run -p scale_cover
+cargo run -p scale-cover
 ```
 
 Optional: build first, then run the binary:
 
 ```bash
-cargo build -p scale_cover
-./target/debug/scale_cover
+cargo build -p scale-cover
+./target/debug/scale-cover
 ```
 
-## Last.fm scrobbler
+## lastfm-scrobbler
 
 See [docs/lastfm-scrobbler.md](docs/lastfm-scrobbler.md) for setup and service instructions.

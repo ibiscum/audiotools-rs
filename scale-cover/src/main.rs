@@ -83,14 +83,10 @@ fn process_cover(input_path: &str, output_path: &str) -> Result<(), String> {
         }
     };
 
-    // 6. Crop to a square starting from top-left (0,0).
-    let square_side = width.min(height);
-    let square_img = img.crop_imm(0, 0, square_side, square_side);
+    // 6. Center-crop and scale image exactly to 1000x1000.
+    let scaled_img = img.resize_to_fill(1000, 1000, FilterType::Lanczos3);
 
-    // 7. Scale square image exactly to 1000x1000.
-    let scaled_img = square_img.resize_exact(1000, 1000, FilterType::Lanczos3);
-
-    // 8. Save processed image atomically as clean JPEG with explicit 4:2:0 subsampling.
+    // 7. Save processed image atomically as clean JPEG with explicit 4:2:0 subsampling.
     let rgb = scaled_img.to_rgb8();
     let output_tmp_path = format!("{output_path}.tmp");
     let output_file = match File::create(&output_tmp_path) {
