@@ -21,6 +21,9 @@ cargo install --path lastfm-scrobbler
 
 `maintain_album_art` scans a directory tree for `.flac` and `.mp3` files and reports whether each file contains embedded album art in its metadata.
 
+See [docs/maintain-album-art.md](docs/maintain-album-art.md) for full usage
+and audit behavior details.
+
 ### Purpose
 
 - Quickly audit a music library for missing embedded cover art.
@@ -37,7 +40,7 @@ cargo install --path lastfm-scrobbler
 	- type
 	- dimensions (`width × height`)
 	- print `[DIR LEVEL OK]` when both `front.jpg` and `folder.jpg` exist and each image is at least `1000 × 1000`
-	- print a separator line of 30 hyphens for directories that contain at least one `.flac`, `.mp3`, or `.m4a` file
+	- print a separator line of 30 hyphens for directories that contain at least one `.flac` or `.mp3` file
 5. Filter to regular files with a `.flac` or `.mp3` extension.
 6. Read metadata (`metaflac` for FLAC, `id3` for MP3) and count embedded pictures.
 7. Print one line per file:
@@ -99,6 +102,9 @@ cargo build -p maintain_album_art
 ## scale_cover
 
 `scale_cover` uses `folder.jpg` as input origin for every run. It validates and normalizes `folder.jpg`, copies the cleaned `folder.jpg` to `front.jpg`, then scales `front.jpg` to exactly `1000x1000`.
+
+See [docs/scale-cover.md](docs/scale-cover.md) for full behavior and failure
+conditions.
 
 ### Purpose
 

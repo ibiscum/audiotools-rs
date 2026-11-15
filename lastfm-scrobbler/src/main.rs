@@ -2,6 +2,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dbus::arg::{PropMap, RefArg};
 use dbus::blocking::Connection as DbusConnection;
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+use env_logger::{Builder, Env, Target};
+use log::{debug, error, info, warn};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rusqlite::{Connection as SqliteConnection, params};
@@ -9,7 +11,7 @@ use rustfm_scrobble::{Scrobble, ScrobbleBatch, Scrobbler};
 use std::cmp;
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -101,7 +103,23 @@ impl Default for PlayerState {
     }
 }
 
+fn init_logging() {
+    Builder::from_env(Env::default().default_filter_or("info"))
+        .target(Target::Stdout)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{:>5}] {}",
+                buf.timestamp_millis(),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+}
+
 fn main() {
+    init_logging();
     let input_backend = parse_input_backend();
     let pipe_path =
         env::var("SHAIRPORT_PIPE").unwrap_or_else(|_| "/tmp/shairport-sync-metadata".to_string());
@@ -113,7 +131,7 @@ fn main() {
 
     let mut credentials: Option<LastfmCredentials> = None;
     let scrobbler = if offline_mode {
-        println!("Last.fm offline mode enabled; skipping authentication and API calls.");
+        info!("Last.fm offline mode enabled; skipping authentication and API calls.");
         None
     } else {
         let api_key = env::var("LASTFM_API_KEY").expect("LASTFM_API_KEY is missing");
@@ -129,7 +147,7 @@ fn main() {
         scrobbler
             .authenticate_with_password(&username, &password)
             .expect("Last.fm authentication failed");
-        println!("Successfully authenticated with Last.fm.");
+        info!("Successfully authenticated with Last.fm.");
         Some(Arc::new(Mutex::new(scrobbler)))
     };
 
@@ -158,7 +176,7 @@ fn main() {
                     if let Ok(mut scr) = scrobbler.lock()
                         && let Err(err) = retry_queued_scrobbles(conn, &mut scr, bg_credentials.as_ref())
                     {
-                        eprintln!("Queue retry error: {}", err);
+                        error!("Queue retry error: {}", err);
                     }
                     last_queue_retry = Instant::now();
                 }
@@ -189,14 +207,14 @@ fn main() {
                         &pending_scrobble,
                         "queued_due_to_backlog",
                     ) {
-                        eprintln!("Failed to persist queued scrobble: {}", queue_err);
+                        error!("Failed to persist queued scrobble: {}", queue_err);
                     }
                     continue;
                 }
 
                 if let Ok(mut scr) = scrobbler.lock() {
                     match scr.scrobble(&scrobble) {
-                        Ok(_) => println!(
+                        Ok(_) => info!(
                             "Scrobbled: {} - {}",
                             pending_scrobble.artist, pending_scrobble.title
                         ),
@@ -208,7 +226,7 @@ fn main() {
                             {
                                 match scr.scrobble(&scrobble) {
                                     Ok(_) => {
-                                        println!(
+                                        info!(
                                             "Scrobbled after re-auth: {} - {}",
                                             pending_scrobble.artist, pending_scrobble.title
                                         );
@@ -221,7 +239,7 @@ fn main() {
                             }
 
                             let is_retriable = is_retriable_scrobble_error(&error_text);
-                            eprintln!(
+                            warn!(
                                 "Scrobble error: {}; queueing decision for {} - {}",
                                 error_text, pending_scrobble.artist, pending_scrobble.title
                             );
@@ -233,10 +251,10 @@ fn main() {
                                         &error_text,
                                     )
                                 {
-                                    eprintln!("Failed to persist queued scrobble: {}", queue_err);
+                                    error!("Failed to persist queued scrobble: {}", queue_err);
                                 }
                             } else {
-                                eprintln!(
+                                warn!(
                                     "Not retrying non-retriable scrobble failure for {} - {}: {}",
                                     pending_scrobble.artist, pending_scrobble.title, error_text
                                 );
@@ -245,7 +263,7 @@ fn main() {
                     }
                 }
             } else {
-                println!(
+                debug!(
                     "Offline mode: skipping scrobble for {} - {}",
                     pending_scrobble.artist, pending_scrobble.title
                 );
@@ -279,11 +297,11 @@ fn run_pipe_input_loop(
     scrobbler: Option<&Arc<Mutex<Scrobbler>>>,
 ) -> ! {
     loop {
-        println!("Opening pipe: {}", pipe_path);
+        debug!("Opening pipe: {}", pipe_path);
         let file = match File::open(pipe_path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Waiting for pipe ({}): {}", pipe_path, e);
+                warn!("Waiting for pipe ({}): {}", pipe_path, e);
                 thread::sleep(Duration::from_secs(3));
                 continue;
             }
@@ -322,7 +340,7 @@ fn run_mpris_input_loop(
     let path = env::var("MPRIS_PATH").unwrap_or_else(|_| "/org/mpris/MediaPlayer2".to_string());
     let conn = open_dbus_connection(&bus);
 
-    println!(
+    info!(
         "Using MPRIS backend on {} bus: service={}, path={}",
         bus, service, path
     );
@@ -330,7 +348,7 @@ fn run_mpris_input_loop(
     loop {
         match read_mpris_snapshot(&conn, &service, &path) {
             Ok(snapshot) => apply_playback_snapshot(&snapshot, state, scrobbler),
-            Err(err) => eprintln!("MPRIS read error: {}", err),
+            Err(err) => warn!("MPRIS read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -350,7 +368,7 @@ fn run_native_dbus_input_loop(
     let path = env::var("SHAIRPORT_DBUS_PATH").unwrap_or_else(|_| "/org/gnome/ShairportSync".to_string());
     let conn = open_dbus_connection(&bus);
 
-    println!(
+    info!(
         "Using native DBus backend on {} bus: service={}, path={}",
         bus, service, path
     );
@@ -358,7 +376,7 @@ fn run_native_dbus_input_loop(
     loop {
         match read_native_dbus_snapshot(&conn, &service, &path) {
             Ok(snapshot) => apply_playback_snapshot(&snapshot, state, scrobbler),
-            Err(err) => eprintln!("DBus read error: {}", err),
+            Err(err) => warn!("DBus read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -429,7 +447,7 @@ fn apply_playback_snapshot(
 ) {
     let mut st = state.lock().unwrap();
     if apply_direct_playback_snapshot(snapshot, &mut st) {
-        println!(
+        info!(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
@@ -439,7 +457,7 @@ fn apply_playback_snapshot(
                 let _ = scr.now_playing(&track);
             }
         } else {
-            println!("Offline mode: skipping Last.fm now playing update.");
+            debug!("Offline mode: skipping Last.fm now playing update.");
         }
     }
 }
@@ -455,7 +473,7 @@ fn process_xml_item(
 
     let mut st = state.lock().unwrap();
     if apply_metadata_item(&item, &mut st) {
-        println!(
+        info!(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
@@ -465,7 +483,7 @@ fn process_xml_item(
                 let _ = scr.now_playing(&track);
             }
         } else {
-            println!("Offline mode: skipping Last.fm now playing update.");
+            debug!("Offline mode: skipping Last.fm now playing update.");
         }
     }
 }
@@ -546,7 +564,7 @@ fn maybe_ready_for_scrobble(st: &mut PlayerState) -> Option<PendingScrobble> {
 
     let Some(threshold) = required_scrobble_play_time(st.current_duration) else {
         st.scrobbled = true;
-        println!(
+        info!(
             "Skipping scrobble (duration <= 30s): {} - {}",
             st.current.artist, st.current.title
         );
@@ -814,11 +832,11 @@ fn should_reauthenticate(error_text: &str) -> bool {
 fn reauthenticate_scrobbler(scrobbler: &mut Scrobbler, creds: &LastfmCredentials) -> bool {
     match scrobbler.authenticate_with_password(&creds.username, &creds.password) {
         Ok(_) => {
-            println!("Re-authenticated Last.fm session.");
+            info!("Re-authenticated Last.fm session.");
             true
         }
         Err(err) => {
-            eprintln!("Failed to re-authenticate Last.fm session: {}", err);
+            error!("Failed to re-authenticate Last.fm session: {}", err);
             false
         }
     }
@@ -849,7 +867,7 @@ fn retry_queued_scrobbles(
                 tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
             }
             tx.commit()?;
-            println!("Retried queued scrobbles batch: {}", queued_scrobbles.len());
+            info!("Retried queued scrobbles batch: {}", queued_scrobbles.len());
             return Ok(());
         }
         Err(err) => {
@@ -865,7 +883,7 @@ fn retry_queued_scrobbles(
                             tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
                         }
                         tx.commit()?;
-                        println!(
+                        info!(
                             "Retried queued scrobbles batch after re-auth: {}",
                             queued_scrobbles.len()
                         );
@@ -907,7 +925,7 @@ fn retry_queued_scrobbles(
                     tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
                 }
                 tx.commit()?;
-                eprintln!(
+                warn!(
                     "Dropping non-retriable queued scrobble batch failure: {}",
                     error_text
                 );

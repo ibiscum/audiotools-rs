@@ -1,10 +1,10 @@
 [package]
-name = "maintain_album_art"
+name = "maintain-album-art"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "maintain_album_art"
+name = "maintain-album-art"
 path = "src/main.rs"
 
 [dependencies]

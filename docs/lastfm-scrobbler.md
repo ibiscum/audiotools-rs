@@ -31,6 +31,9 @@ Failed scrobbles are queued in SQLite for retries. By default the queue
 database is `/var/lib/shairport-scrobbler/scrobble-queue.sqlite3`. Override via
 `LASTFM_QUEUE_DB` if needed.
 
+Logging uses standard Rust log levels (`error`, `warn`, `info`, `debug`,
+`trace`) and is controlled with `RUST_LOG` (default level is `info`).
+
 ### Input backend configuration (exclusive mode)
 
 Set one backend in the service:
@@ -266,6 +269,12 @@ Verify both services and logs:
 ```bash
 systemctl status shairport-sync shairport-scrobbler --no-pager
 journalctl -u shairport-sync -u shairport-scrobbler -n 200 --no-pager
+```
+
+Optional: increase log verbosity for troubleshooting:
+
+```ini
+Environment="RUST_LOG=debug"
 ```
 
 ## Behavior

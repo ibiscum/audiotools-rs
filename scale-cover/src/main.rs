@@ -1,17 +1,37 @@
+use env_logger::{Builder, Env, Target};
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use image::imageops::FilterType;
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+use log::{debug, error, info, warn};
 use zune_jpeg::{JpegDecoder, zune_core::colorspace::ColorSpace};
 
+fn init_logging() {
+    Builder::from_env(Env::default().default_filter_or("info"))
+        .target(Target::Stdout)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{:>5}] {}",
+                buf.timestamp_millis(),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+}
+
 fn main() {
+    init_logging();
     let input_path = "folder.jpg";
     let output_path = "front.jpg";
 
-    println!("Checking whether '{}' is a valid JPEG image...", input_path);
+    info!("Checking whether '{}' is a valid JPEG image...", input_path);
     if let Err(err) = process_cover(input_path, output_path) {
-        eprintln!("Error: {}", err);
+        error!("Error: {}", err);
+        std::process::exit(1);
     }
 }
 
@@ -23,7 +43,7 @@ fn process_cover(input_path: &str, output_path: &str) -> Result<(), String> {
             input_path, err
         ));
     }
-    println!("✓ File structure validated and re-encoded.");
+    info!("File structure validated and re-encoded.");
 
     // 2. Load origin image from folder.jpg
     let origin_img = match image::open(input_path) {
@@ -45,12 +65,12 @@ fn process_cover(input_path: &str, output_path: &str) -> Result<(), String> {
 
     // 4. Copy cleaned origin to output path before scaling.
     copy_file_atomically(input_path, output_path)?;
-    println!(
+    info!(
         "✓ Copied cleaned origin '{}' to '{}'.",
         input_path, output_path
     );
 
-    println!("Scaling image to 1000x1000 pixels...");
+    info!("Scaling image to 1000x1000 pixels...");
 
     // 5. Load copied cleaned image from output path for scaling.
     let img = match image::open(output_path) {
@@ -91,12 +111,12 @@ fn process_cover(input_path: &str, output_path: &str) -> Result<(), String> {
     if let Err(e) = std::fs::rename(&output_tmp_path, output_path) {
         remove_file_if_exists(&output_tmp_path, "temporary output file");
         return Err(format!(
-            "replacing '{}' with '{}': {}",
-            output_path, output_tmp_path, e
+            "renaming '{}' to '{}': {}",
+            output_tmp_path, output_path, e
         ));
     }
 
-    println!(
+    info!(
         "✓ Image successfully scaled from '{}' and saved as '{}'.",
         input_path, output_path
     );
@@ -134,10 +154,10 @@ fn remove_file_if_exists(path: &str, label: &str) {
 
     match std::fs::remove_file(path) {
         Ok(_) => {
-            println!("✓ Removed {} '{}'.", label, path);
+            debug!("Removed {} '{}'.", label, path);
         }
         Err(e) => {
-            eprintln!("Error removing {} '{}': {}", label, path, e);
+            warn!("Error removing {} '{}': {}", label, path, e);
         }
     }
 }

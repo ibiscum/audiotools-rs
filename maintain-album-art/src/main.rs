@@ -96,7 +96,7 @@ fn parse_args() -> (String, bool) {
 }
 
 fn is_audio_extension(ext: &str) -> bool {
-    ext == "flac" || ext == "mp3" || ext == "m4a"
+    ext == "flac" || ext == "mp3"
 }
 
 fn is_image_extension(ext: &str) -> bool {
@@ -111,7 +111,18 @@ fn scan_directory(path: &Path) -> Option<DirectoryScan> {
             let mut has_folder_jpg_1000 = false;
             let mut has_audio_files = false;
 
-            for child in entries.filter_map(|e| e.ok()) {
+            for child_result in entries {
+                let child = match child_result {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        warn!(
+                            "Could not read entry in directory '{}': {}",
+                            path.display(),
+                            err
+                        );
+                        continue;
+                    }
+                };
                 let child_path = child.path();
                 if !child_path.is_file() {
                     continue;
@@ -275,8 +286,10 @@ fn process_flac_file(
                 warn!("[MISSING] {}", file_name);
             }
         }
-        Err(_) => {
+        Err(err) => {
             error!("Could not read metadata for: {}", file_name);
+            debug!("FLAC metadata error for '{}': {}", path.display(), err);
+            stats.missing_art += 1;
             stats.missing_front_cover_1000 += 1;
         }
     }
@@ -351,8 +364,10 @@ fn process_mp3_file(
                 warn!("[MISSING] {}", file_name);
             }
         }
-        Err(_) => {
+        Err(err) => {
             error!("Could not read metadata for: {}", file_name);
+            debug!("MP3 metadata error for '{}': {}", path.display(), err);
+            stats.missing_art += 1;
             stats.missing_front_cover_1000 += 1;
         }
     }
@@ -454,7 +469,14 @@ fn main() {
     let mut stats = SummaryStats::default();
     let mut dir_audits: BTreeMap<PathBuf, DirAudit> = BTreeMap::new();
 
-    for entry in WalkDir::new(&dir_path).into_iter().filter_map(|e| e.ok()) {
+    for entry_result in WalkDir::new(&dir_path) {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!("Skipping unreadable filesystem entry: {}", err);
+                continue;
+            }
+        };
         let path = entry.path();
         trace!("WalkDir entry: {}", path.display());
 
