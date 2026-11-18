@@ -4,6 +4,8 @@
 
 ### lastfm-scrobbler
 
+- Fixed MPD idle-session socket handling to avoid periodic reconnect churn from
+  `WouldBlock`/`os error 11` when no player events are emitted.
 - Switched scrobble delivery to direct-send-first behavior: tracks are sent to
   Last.fm immediately when eligible, with SQLite used as fallback only for
   retriable failures.

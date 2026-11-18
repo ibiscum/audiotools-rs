@@ -865,7 +865,7 @@ fn run_mpd_worker_loop(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind)
 fn connect_mpd_session(host: &str, port: u16) -> Result<(TcpStream, BufReader<TcpStream>), String> {
     let stream = TcpStream::connect((host, port)).map_err(|err| err.to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| err.to_string())?;
     stream
         .set_write_timeout(Some(Duration::from_secs(30)))
@@ -879,6 +879,11 @@ fn connect_mpd_session(host: &str, port: u16) -> Result<(TcpStream, BufReader<Tc
     if !greeting.starts_with("OK MPD") {
         return Err(format!("unexpected MPD greeting: {}", greeting.trim_end()));
     }
+    stream.set_read_timeout(None).map_err(|err| err.to_string())?;
+    reader
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(|err| err.to_string())?;
     Ok((stream, reader))
 }
 
