@@ -1,6 +1,6 @@
-# scale_cover
+# scale-cover
 
-`scale_cover` standardizes cover images in the current directory by using
+`scale-cover` standardizes cover images in the current directory by using
 `folder.jpg` as source and producing `front.jpg` as exact `1000x1000` JPEG.
 
 ## Purpose
@@ -32,26 +32,26 @@ This binary does not take command-line arguments.
 From the workspace root (directory must contain `folder.jpg`):
 
 ```bash
-cargo run -p scale_cover
+cargo run -p scale-cover
 ```
 
 Optional build + run:
 
 ```bash
-cargo build -p scale_cover
-./target/debug/scale_cover
+cargo build -p scale-cover
+./target/debug/scale-cover
 ```
 
 ## Logging
 
-`scale_cover` uses standard leveled logging (`error`, `warn`, `info`, `debug`,
+`scale-cover` uses standard leveled logging (`error`, `warn`, `info`, `debug`,
 `trace`) and defaults to `info`.
 
 Use `RUST_LOG` to change verbosity:
 
 ```bash
-RUST_LOG=debug cargo run -p scale_cover
-RUST_LOG=trace cargo run -p scale_cover
+RUST_LOG=debug cargo run -p scale-cover
+RUST_LOG=trace cargo run -p scale-cover
 ```
 
 ## Failure conditions
