@@ -17,9 +17,17 @@
     items, plus dead-letter TTL purge
 - Added regression tests for now-playing coalescing, queue persistence, and
   dead-letter/retention behavior.
+- Added multi-source input arbitration with a new `LASTFM_INPUT_BACKEND=auto`
+  mode:
+  - runs dedicated workers for MPD (idle events) and Shairport backends
+  - selects one active source at a time and switches on activity changes
+  - avoids duplicate now-playing updates when sources report the same track
 
 ### Documentation
 
 - Expanded [lastfm-scrobbler docs](/home/ulf/data/audiotools-rs/docs/lastfm-scrobbler.md) with
   runtime flow details and Mermaid sequence/state diagrams.
 - Documented queue hardening settings and defaults.
+- Added headless `systemd --user` deployment guidance for MPD, mpdris2,
+  lastfm-scrobbler, shairport-sync, snapserver, and snapclient, including
+  lingering and package-update persistence notes.

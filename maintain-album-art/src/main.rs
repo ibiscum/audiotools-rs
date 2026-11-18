@@ -1,11 +1,11 @@
 use env_logger::{Builder, Env, Target};
-use id3::frame::PictureType as Id3PictureType;
 use id3::TagLike;
+use id3::frame::PictureType as Id3PictureType;
 use image::image_dimensions;
 use image::{GenericImageView, load_from_memory};
 use log::{debug, error, info, trace, warn};
-use metaflac::block::PictureType;
 use metaflac::Tag;
+use metaflac::block::PictureType;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -179,21 +179,13 @@ fn scan_directory(path: &Path) -> Option<DirectoryScan> {
             })
         }
         Err(err) => {
-            error!(
-                "Could not read directory '{}': {}",
-                path.display(),
-                err
-            );
+            error!("Could not read directory '{}': {}", path.display(), err);
             None
         }
     }
 }
 
-fn process_directory(
-    path: &Path,
-    depth: usize,
-    dir_audits: &mut BTreeMap<PathBuf, DirAudit>,
-) {
+fn process_directory(path: &Path, depth: usize, dir_audits: &mut BTreeMap<PathBuf, DirAudit>) {
     let Some(scan) = scan_directory(path) else {
         return;
     };
@@ -421,15 +413,27 @@ fn print_final_summary(
         info!("directory: {}", display_path.display());
         info!(
             "status: {}",
-            if complete_ok { "COMPLETE OK" } else { "INCOMPLETE" }
+            if complete_ok {
+                "COMPLETE OK"
+            } else {
+                "INCOMPLETE"
+            }
         );
         info!(
             "front.jpg 1000x1000: {}",
-            if audit.has_front_jpg_1000 { "yes" } else { "no" }
+            if audit.has_front_jpg_1000 {
+                "yes"
+            } else {
+                "no"
+            }
         );
         info!(
             "folder.jpg >=1000x1000: {}",
-            if audit.has_folder_jpg_1000 { "yes" } else { "no" }
+            if audit.has_folder_jpg_1000 {
+                "yes"
+            } else {
+                "no"
+            }
         );
         let missing_front_cover_1000 = audit.total_tracks - audit.tracks_with_front_cover_1000;
         if skip_complete_in_summary {

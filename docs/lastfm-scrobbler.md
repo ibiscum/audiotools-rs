@@ -1,8 +1,8 @@
 # lastfm-scrobbler
 
-This workspace application reads Shairport Sync metadata from exactly one input
-backend (`pipe`, `dbus`, or `mpris`), sends Last.fm “Now Playing” updates, and
-attempts to scrobble recognized tracks.
+This workspace application reads playback metadata from Shairport Sync and/or
+MPD, sends Last.fm “Now Playing” updates, and attempts to scrobble recognized
+tracks.
 
 The package manifest is at `lastfm-scrobbler/Cargo.toml`; its implementation is
 in [`src/main.rs`](../lastfm-scrobbler/src/main.rs). Run the following commands
@@ -14,9 +14,9 @@ from the workspace root.
   DBus, or MPRIS).
 - A Last.fm account and API key/shared secret.
 - The Last.fm account username and password used for password authentication.
-- Select exactly one metadata backend via `LASTFM_INPUT_BACKEND` (`pipe`,
-  `dbus`, or `mpris`; default is `pipe`). See
-  [Input backend configuration (exclusive mode)](#input-backend-configuration-exclusive-mode).
+- Select an input mode via `LASTFM_INPUT_BACKEND` (`pipe`, `dbus`, `mpris`, or
+  `auto`; default is `pipe`). See
+  [Input backend configuration](#input-backend-configuration).
 
 For local/offline preparation without real Last.fm credentials, set
 `LASTFM_OFFLINE_MODE=1`. In offline mode the app still reads and parses
@@ -41,7 +41,7 @@ At `info` level, successful Last.fm responses are also logged as accepted
 (`Last.fm accepted ...`), including normalized response metadata and scrobble
 timestamp.
 
-### Input backend configuration (exclusive mode)
+### Input backend configuration
 
 Set one backend in the service:
 
@@ -61,21 +61,52 @@ or
 Environment="LASTFM_INPUT_BACKEND=mpris"
 ```
 
-Only configure environment variables for the selected backend:
+or
+
+```ini
+Environment="LASTFM_INPUT_BACKEND=auto"
+```
+
+Configure environment variables for the selected backend:
 - `pipe`: `SHAIRPORT_PIPE`
 - `dbus`: `SHAIRPORT_DBUS_BUS`, `SHAIRPORT_DBUS_SERVICE`,
   `SHAIRPORT_DBUS_PATH`
 - `mpris`: `MPRIS_BUS`, `MPRIS_SERVICE`, `MPRIS_PATH`
+- `auto`: MPD + Shairport source arbitration:
+  - `LASTFM_AUTO_SHAIRPORT_BACKEND` (`pipe`, `dbus`, or `mpris`; default
+    `pipe`)
+  - MPD endpoint: `MPD_HOST` (default `127.0.0.1`), `MPD_PORT` (default
+    `6600`), optional `MPD_PASSWORD`
 
 Note: the `pipe` backend currently supports Shairport Sync metadata format
 only (XML/DMAP items from Shairport's metadata pipe).
 
 If `dbus` or `mpris` is selected, leave `SHAIRPORT_PIPE` unset. If `pipe` is
 selected, leave DBus/MPRIS override variables unset.
+If `auto` is selected, configure Shairport variables according to
+`LASTFM_AUTO_SHAIRPORT_BACKEND`.
+
+#### Automatic source arbitration (`LASTFM_INPUT_BACKEND=auto`)
+
+In `auto` mode, `lastfm-scrobbler` runs separate workers for:
+- MPD (event-driven via MPD `idle player` events)
+- Shairport Sync (via the selected Shairport backend)
+
+The source arbiter keeps one active source at a time:
+- it stays on the current active source while that source is actively playing
+  and provides artist/title metadata,
+- it switches when the active source becomes inactive and another source is
+  active.
+
+This prevents duplicate now-playing/scrobble transitions when both sources
+report the same track.
 
 ### Getting metadata from Shairport Sync
 
-1. Edit `/etc/shairport-sync.conf` and enable metadata output to a named pipe.
+1. Edit Shairport Sync config and enable metadata output to a named pipe.
+   - User-service setup (recommended here): `~/.config/shairport-sync/shairport-sync.conf`
+   - System-service setup: `/etc/shairport-sync.conf`
+   Replace `<UID>` with your numeric user id (`id -u`).
    Example:
 
    ```conf
@@ -83,26 +114,26 @@ selected, leave DBus/MPRIS override variables unset.
    {
        enabled = "yes";
        include_cover_art = "no";
-       pipe_name = "/tmp/shairport-sync-metadata";
+       pipe_name = "/run/user/<UID>/shairport-sync-metadata";
    };
    ```
 
 2. Restart Shairport Sync:
 
    ```bash
-   sudo systemctl restart shairport-sync
+   systemctl --user restart shairport-sync
    ```
 
 3. Confirm the metadata pipe exists:
 
    ```bash
-   ls -l /tmp/shairport-sync-metadata
+   ls -l /run/user/<UID>/shairport-sync-metadata
    ```
 
 4. Verify metadata is flowing while AirPlay playback is active:
 
    ```bash
-   sudo timeout 60s cat /tmp/shairport-sync-metadata
+   timeout 60s cat /run/user/<UID>/shairport-sync-metadata
    ```
 
    You should see XML `<item>...</item>` records.
@@ -173,6 +204,10 @@ selected, leave DBus/MPRIS override variables unset.
 Use this path when you want to scrobble tracks played by MPD. The
 `lastfm-scrobbler` process reads MPRIS metadata, so MPD must expose an MPRIS
 service (commonly through `mpDris2`).
+
+If you also run Shairport Sync and want automatic switching between MPD and
+Shairport, use `LASTFM_INPUT_BACKEND=auto` instead of `mpris` and set
+`LASTFM_AUTO_SHAIRPORT_BACKEND` for the Shairport side.
 
 Package names by distro:
 
@@ -248,15 +283,15 @@ Package names by distro:
 6. Reload and restart the scrobbler service.
 
   ```bash
-  sudo systemctl daemon-reload
-  sudo systemctl restart lastfm-scrobbler
-  sudo systemctl status lastfm-scrobbler --no-pager
+  systemctl --user daemon-reload
+  systemctl --user restart lastfm-scrobbler
+  systemctl --user status lastfm-scrobbler --no-pager
   ```
 
 7. Validate end-to-end behavior while playing music in MPD.
 
   ```bash
-  journalctl -u lastfm-scrobbler -f --no-pager
+  journalctl --user -u lastfm-scrobbler -f --no-pager
   ```
 
   Look for log lines similar to:
@@ -296,14 +331,14 @@ Troubleshooting:
 3. Reload and restart the service after updating credentials:
 
    ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl restart lastfm-scrobbler
+   systemctl --user daemon-reload
+   systemctl --user restart lastfm-scrobbler
    ```
 
 4. Verify authentication succeeded:
 
    ```bash
-   journalctl -u lastfm-scrobbler -n 100 --no-pager
+   journalctl --user -u lastfm-scrobbler -n 100 --no-pager
    ```
 
    On successful startup, the app logs:
@@ -329,86 +364,354 @@ cargo build --release -p lastfm-scrobbler
 sudo install -m 755 target/release/lastfm-scrobbler /usr/local/bin/
 ```
 
-## Run as a systemd service (with Shairport Sync dependency)
+## Run as `systemd --user` services (headless-safe full stack)
 
-Install and enable Shairport Sync first:
+This is the recommended deployment for headless systems when you run:
+- `mpd`
+- `mpdris2`
+- `lastfm-scrobbler`
+- `shairport-sync`
+- `snapserver`
+- `snapclient`
+
+Using one dedicated user for all of them keeps DBus/session access consistent
+(`mpdris2` + MPRIS + `lastfm-scrobbler`) and avoids cross-bus/system-vs-user
+permission issues.
+
+### 1. Create/use a dedicated audio user and keep user services alive
+
+Replace `<USER>` with your service account (for example `audio`).
+
+`systemd --user` services normally stop when no login session exists. On
+headless systems, enable lingering so the per-user systemd manager keeps
+running at boot and after logout:
 
 ```bash
-sudo systemctl enable --now shairport-sync
-sudo systemctl status shairport-sync --no-pager
+sudo loginctl enable-linger <USER>
+loginctl show-user <USER> -p Linger
 ```
 
-Then create the scrobbler service at
-`/etc/systemd/system/lastfm-scrobbler.service`:
+Expected output includes `Linger=yes`.
+
+To disable this behavior later:
+
+```bash
+sudo loginctl disable-linger <USER>
+```
+
+### 2. Install required packages
+
+Debian/Ubuntu example:
+
+```bash
+sudo apt update
+sudo apt install mpd mpdris2 shairport-sync snapserver snapclient
+```
+
+### Package updates: preserving custom configuration
+
+Yes, custom configuration can be preserved across Debian package updates, if you
+keep local changes in the right locations.
+
+What package updates usually do:
+- `/etc/mpd.conf` and `/etc/shairport-sync.conf` are package conffiles. Local
+  edits are not silently overwritten; `dpkg` asks how to handle conflicts.
+- Vendor unit files under `/lib/systemd/system/*.service` are replaced on
+  updates.
+- User files under `~/.config/...` are not managed by `apt`/`dpkg`.
+
+How to fulfill this requirement reliably:
+1. Keep your active service configs in user space:
+   - `~/.config/mpd/mpd.conf`
+   - `~/.config/shairport-sync/shairport-sync.conf`
+2. Keep custom user units in:
+   - `~/.config/systemd/user/`
+3. Do not edit vendor units in `/lib/systemd/system`; use overrides instead:
+   - system services: `sudo systemctl edit <service>`
+   - user services: `systemctl --user edit <service>`
+4. After package upgrades, verify service health:
+
+   ```bash
+   systemctl --user status mpd mpdris2 shairport-sync snapserver snapclient lastfm-scrobbler --no-pager
+   journalctl --user -u mpd -u shairport-sync -u lastfm-scrobbler -n 100 --no-pager
+   ```
+
+Optional but recommended:
+- Keep `~/.config/mpd/`, `~/.config/shairport-sync/`, and
+  `~/.config/systemd/user/` in version control.
+
+### 3. Build and install `lastfm-scrobbler` for that user
+
+Run as `<USER>` (not root):
+
+```bash
+cargo build --release -p lastfm-scrobbler
+install -d -m 755 ~/.local/bin
+install -m 755 target/release/lastfm-scrobbler ~/.local/bin/lastfm-scrobbler
+```
+
+### 4. Prepare config and runtime paths
+
+Run as `<USER>`:
+
+```bash
+id -u
+install -d -m 700 ~/.config/mpd ~/.config/shairport-sync ~/.config/snapserver ~/.config/systemd/user
+```
+
+Save your numeric UID from `id -u` as `<UID>` for the next configs.
+
+### 5. Create minimal config files
+
+`~/.config/mpd/mpd.conf`:
+
+```conf
+music_directory "~/Music"
+playlist_directory "~/.config/mpd/playlists"
+db_file "~/.config/mpd/database"
+log_file "~/.config/mpd/log"
+pid_file "~/.config/mpd/pid"
+state_file "~/.config/mpd/state"
+sticker_file "~/.config/mpd/sticker.sql"
+
+bind_to_address "127.0.0.1"
+port "6600"
+
+audio_output {
+    type "alsa"
+    name "default"
+}
+```
+
+`~/.config/shairport-sync/shairport-sync.conf`:
+
+```conf
+general =
+{
+    name = "Headless AirPlay";
+};
+
+metadata =
+{
+    enabled = "yes";
+    include_cover_art = "no";
+    pipe_name = "/run/user/<UID>/shairport-sync-metadata";
+};
+
+audio =
+{
+    output_backend = "pipe";
+};
+
+pipe =
+{
+    name = "/run/user/<UID>/snapfifo";
+    audio_backend_latency_offset = 0;
+};
+```
+
+`~/.config/snapserver/snapserver.conf`:
+
+```conf
+[stream]
+source = pipe:///run/user/<UID>/snapfifo?name=AirPlay&mode=read
+```
+
+### 6. Create user service units
+
+Create these files under `~/.config/systemd/user/`.
+
+`mpd.service`:
 
 ```ini
 [Unit]
-Description=lastfm-scrobbler
-# Start only after Shairport Sync is up.
-After=shairport-sync.service
-# Pull in Shairport Sync when this service starts.
+Description=Music Player Daemon
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mpd --no-daemon %h/.config/mpd/mpd.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+`mpdris2.service`:
+
+```ini
+[Unit]
+Description=MPD to MPRIS bridge
+After=mpd.service
+Requires=mpd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mpdris2
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+If your distro installs the binary as `mpDris2`, change `ExecStart` to
+`/usr/bin/mpDris2`.
+
+`shairport-sync.service`:
+
+```ini
+[Unit]
+Description=Shairport Sync (AirPlay receiver)
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/test -p /run/user/%U/snapfifo || /usr/bin/mkfifo /run/user/%U/snapfifo
+ExecStartPre=/usr/bin/test -p /run/user/%U/shairport-sync-metadata || /usr/bin/mkfifo /run/user/%U/shairport-sync-metadata
+ExecStart=/usr/bin/shairport-sync -c %h/.config/shairport-sync/shairport-sync.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+`snapserver.service`:
+
+```ini
+[Unit]
+Description=Snapcast server
+After=network-online.target shairport-sync.service
+Wants=network-online.target
 Requires=shairport-sync.service
 
 [Service]
 Type=simple
-Environment="LASTFM_INPUT_BACKEND=pipe"
-# For production, prefer the encrypted credential mechanism documented below:
-# "Using encrypted systemd credentials (recommended)".
+ExecStart=/usr/bin/snapserver --config %h/.config/snapserver/snapserver.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+`snapclient.service`:
+
+```ini
+[Unit]
+Description=Snapcast client
+After=snapserver.service
+Requires=snapserver.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/snapclient --host 127.0.0.1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+```
+
+`lastfm-scrobbler.service`:
+
+```ini
+[Unit]
+Description=lastfm-scrobbler
+After=network-online.target mpdris2.service
+Wants=network-online.target
+Requires=mpdris2.service
+
+[Service]
+Type=simple
+Environment="LASTFM_INPUT_BACKEND=auto"
+Environment="LASTFM_AUTO_SHAIRPORT_BACKEND=pipe"
+Environment="MPD_HOST=127.0.0.1"
+Environment="MPD_PORT=6600"
+# Optional if MPD requires password authentication:
+# Environment="MPD_PASSWORD=your_mpd_password"
+# Optional if you choose dbus/mpris for LASTFM_AUTO_SHAIRPORT_BACKEND:
+# Environment="SHAIRPORT_DBUS_BUS=session"
+# Environment="SHAIRPORT_DBUS_SERVICE=org.gnome.ShairportSync"
+# Environment="SHAIRPORT_DBUS_PATH=/org/gnome/ShairportSync"
+# Environment="MPRIS_BUS=session"
+# Environment="MPRIS_SERVICE=org.mpris.MediaPlayer2.ShairportSync"
+# Environment="MPRIS_PATH=/org/mpris/MediaPlayer2"
+# For production, prefer encrypted credentials (section below).
 Environment="LASTFM_API_KEY=your_api_key"
 Environment="LASTFM_API_SECRET=your_api_secret"
 Environment="LASTFM_USERNAME=your_username"
 Environment="LASTFM_PASSWORD=your_password"
-# Optional for local testing without Last.fm credentials/API calls.
-# Environment="LASTFM_OFFLINE_MODE=1"
-# Optional SQLite path for failed scrobble retry queue.
-# Environment="LASTFM_QUEUE_DB=/var/lib/shairport-scrobbler/scrobble-queue.sqlite3"
-# Optional; defaults to /tmp/shairport-sync-metadata.
-# Environment="SHAIRPORT_PIPE=/path/to/shairport-sync-metadata"
-# Optional DBus backend overrides.
-# Environment="SHAIRPORT_DBUS_BUS=system"
-# Environment="SHAIRPORT_DBUS_SERVICE=org.gnome.ShairportSync"
-# Environment="SHAIRPORT_DBUS_PATH=/org/gnome/ShairportSync"
-# Optional MPRIS backend overrides.
-# Environment="MPRIS_BUS=system"
-# Environment="MPRIS_SERVICE=org.mpris.MediaPlayer2.ShairportSync"
-# Environment="MPRIS_PATH=/org/mpris/MediaPlayer2"
-ExecStart=/usr/local/bin/lastfm-scrobbler
+# Optional:
+# Environment="RUST_LOG=info"
+ExecStart=%h/.local/bin/lastfm-scrobbler
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 ```
 
-Dependency behavior:
-- `After=shairport-sync.service`: startup ordering (scrobbler starts after
-  Shairport Sync).
-- `Requires=shairport-sync.service`: if Shairport Sync fails to start, this
-  service is not started.
-- The scrobbler also retries opening the metadata pipe every three seconds, so
-  short races during boot are tolerated.
+If `busctl --user list | grep -E 'org\.mpris\.MediaPlayer2'` shows a different
+MPRIS service name, set `MPRIS_SERVICE` to that value (when using MPRIS input).
 
-If you keep inline credentials in the unit file, protect it, then reload and
-enable it:
+### 7. Enable and start all user services
 
 ```bash
-sudo chmod 600 /etc/systemd/system/lastfm-scrobbler.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now lastfm-scrobbler
+systemctl --user daemon-reload
+systemctl --user enable --now mpd mpdris2 shairport-sync snapserver snapclient lastfm-scrobbler
+systemctl --user status mpd mpdris2 shairport-sync snapserver snapclient lastfm-scrobbler --no-pager
 ```
 
-Verify both services and logs:
+### 8. Validate the stack end-to-end
+
+Check MPRIS visibility:
 
 ```bash
-systemctl status shairport-sync lastfm-scrobbler --no-pager
-journalctl -u shairport-sync -u lastfm-scrobbler -n 200 --no-pager
+busctl --user list | grep -E 'org\.mpris\.MediaPlayer2'
 ```
 
-Optional: increase log verbosity for troubleshooting:
+Check all logs:
 
-```ini
-Environment="RUST_LOG=debug"
+```bash
+journalctl --user -u mpd -u mpdris2 -u shairport-sync -u snapserver -u snapclient -u lastfm-scrobbler -n 200 --no-pager
 ```
+
+Follow scrobbler logs live:
+
+```bash
+journalctl --user -u lastfm-scrobbler -f --no-pager
+```
+
+Look for:
+- `Auto input mode enabled. Shairport backend=..., MPD idle-events enabled.`
+- `Connected to MPD at 127.0.0.1:6600`
+- `Active playback source switched to ...`
+- `Now Playing: Artist - Title (Album)`
+- `Last.fm accepted now playing: ...`
+- `Last.fm accepted scrobble: ...`
+
+### 9. Common headless troubleshooting
+
+- `Failed to connect to session DBus`: ensure lingering is enabled and the
+  service runs as the intended user account.
+- `Waiting for MPD at ...`: verify `mpd` is running, and `MPD_HOST`/`MPD_PORT`
+  match your MPD listener.
+- No `org.mpris.MediaPlayer2.*`: verify `mpdris2` is running and connected to
+  the same `mpd` instance.
+- `snapserver` cannot read FIFO: verify `<UID>` in config paths and that
+  `/run/user/<UID>/snapfifo` exists.
+- Missing tags in scrobbles: confirm MPD files contain artist/title metadata.
+- If you change unit files, always run:
+
+  ```bash
+  systemctl --user daemon-reload
+  systemctl --user restart <service>
+  ```
 
 ## Using encrypted systemd credentials (recommended)
 
@@ -420,18 +723,18 @@ With current `lastfm-scrobbler`, no wrapper script is required.
 Create the encrypted credential store directory:
 
 ```bash
-sudo install -d -m 700 /etc/credstore.encrypted
+install -d -m 700 ~/.config/credstore.encrypted
 ```
 
 Encrypt each secret into its own file:
 
 ```bash
-read -rsp "LASTFM_API_KEY: " V; echo;    printf '%s' "$V" | sudo systemd-creds encrypt - /etc/credstore.encrypted/lastfm_api_key; unset V
-read -rsp "LASTFM_API_SECRET: " V; echo; printf '%s' "$V" | sudo systemd-creds encrypt - /etc/credstore.encrypted/lastfm_api_secret; unset V
-read -rsp "LASTFM_USERNAME: " V; echo;   printf '%s' "$V" | sudo systemd-creds encrypt - /etc/credstore.encrypted/lastfm_username; unset V
-read -rsp "LASTFM_PASSWORD: " V; echo;   printf '%s' "$V" | sudo systemd-creds encrypt - /etc/credstore.encrypted/lastfm_password; unset V
+read -rsp "LASTFM_API_KEY: " V; echo;    printf '%s' "$V" | systemd-creds encrypt - ~/.config/credstore.encrypted/lastfm_api_key; unset V
+read -rsp "LASTFM_API_SECRET: " V; echo; printf '%s' "$V" | systemd-creds encrypt - ~/.config/credstore.encrypted/lastfm_api_secret; unset V
+read -rsp "LASTFM_USERNAME: " V; echo;   printf '%s' "$V" | systemd-creds encrypt - ~/.config/credstore.encrypted/lastfm_username; unset V
+read -rsp "LASTFM_PASSWORD: " V; echo;   printf '%s' "$V" | systemd-creds encrypt - ~/.config/credstore.encrypted/lastfm_password; unset V
 
-sudo chmod 600 /etc/credstore.encrypted/*
+chmod 600 ~/.config/credstore.encrypted/*
 ```
 
 ### 2. Configure service override
@@ -439,12 +742,12 @@ sudo chmod 600 /etc/credstore.encrypted/*
 Create/edit a drop-in:
 
 ```bash
-sudo systemctl edit lastfm-scrobbler
+systemctl --user edit lastfm-scrobbler
 ```
 
 Drop-in files for this service are stored in:
 
-`/etc/systemd/system/lastfm-scrobbler.service.d/`
+`~/.config/systemd/user/lastfm-scrobbler.service.d/`
 
 Naming:
 - default (recommended): `override.conf`
@@ -458,26 +761,26 @@ Add:
 [Service]
 UnsetEnvironment=LASTFM_API_KEY LASTFM_API_SECRET LASTFM_USERNAME LASTFM_PASSWORD
 
-LoadCredentialEncrypted=lastfm_api_key:/etc/credstore.encrypted/lastfm_api_key
-LoadCredentialEncrypted=lastfm_api_secret:/etc/credstore.encrypted/lastfm_api_secret
-LoadCredentialEncrypted=lastfm_username:/etc/credstore.encrypted/lastfm_username
-LoadCredentialEncrypted=lastfm_password:/etc/credstore.encrypted/lastfm_password
+LoadCredentialEncrypted=lastfm_api_key:%h/.config/credstore.encrypted/lastfm_api_key
+LoadCredentialEncrypted=lastfm_api_secret:%h/.config/credstore.encrypted/lastfm_api_secret
+LoadCredentialEncrypted=lastfm_username:%h/.config/credstore.encrypted/lastfm_username
+LoadCredentialEncrypted=lastfm_password:%h/.config/credstore.encrypted/lastfm_password
 ```
 
 ### 3. Reload and restart
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart lastfm-scrobbler
-sudo systemctl status lastfm-scrobbler --no-pager
-systemctl cat lastfm-scrobbler --no-pager
+systemctl --user daemon-reload
+systemctl --user restart lastfm-scrobbler
+systemctl --user status lastfm-scrobbler --no-pager
+systemctl --user cat lastfm-scrobbler --no-pager
 ```
 
 ### 4. Verify no secrets are exposed in unit environment
 
 ```bash
-systemctl show lastfm-scrobbler -p Environment --no-pager
-journalctl -u lastfm-scrobbler -n 50 --no-pager
+systemctl --user show lastfm-scrobbler -p Environment --no-pager
+journalctl --user -u lastfm-scrobbler -n 50 --no-pager
 ```
 
 ### Optional: explicit file-variable mapping
@@ -498,7 +801,7 @@ Environment="LASTFM_PASSWORD_FILE=%d/lastfm_password"
 ## How `systemd-creds` encrypt/decrypt works
 
 - `systemd-creds encrypt` stores encrypted blobs in
-  `/etc/credstore.encrypted/`.
+  `~/.config/credstore.encrypted/`.
 - `LoadCredentialEncrypted=` tells systemd to decrypt those blobs at service
   start.
 - Decrypted values are exposed as files under `$CREDENTIALS_DIRECTORY`
@@ -510,7 +813,7 @@ Environment="LASTFM_PASSWORD_FILE=%d/lastfm_password"
 Manual admin decrypt example:
 
 ```bash
-sudo systemd-creds decrypt /etc/credstore.encrypted/lastfm_api_key -
+systemd-creds decrypt ~/.config/credstore.encrypted/lastfm_api_key -
 ```
 
 ## Runtime flow
