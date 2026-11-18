@@ -12,7 +12,7 @@ use std::cmp;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -134,10 +134,26 @@ fn main() {
         info!("Last.fm offline mode enabled; skipping authentication and API calls.");
         None
     } else {
-        let api_key = env::var("LASTFM_API_KEY").expect("LASTFM_API_KEY is missing");
-        let api_secret = env::var("LASTFM_API_SECRET").expect("LASTFM_API_SECRET is missing");
-        let username = env::var("LASTFM_USERNAME").expect("LASTFM_USERNAME is missing");
-        let password = env::var("LASTFM_PASSWORD").expect("LASTFM_PASSWORD is missing");
+        let api_key = load_required_secret(
+            "LASTFM_API_KEY",
+            "LASTFM_API_KEY_FILE",
+            "lastfm_api_key",
+        );
+        let api_secret = load_required_secret(
+            "LASTFM_API_SECRET",
+            "LASTFM_API_SECRET_FILE",
+            "lastfm_api_secret",
+        );
+        let username = load_required_secret(
+            "LASTFM_USERNAME",
+            "LASTFM_USERNAME_FILE",
+            "lastfm_username",
+        );
+        let password = load_required_secret(
+            "LASTFM_PASSWORD",
+            "LASTFM_PASSWORD_FILE",
+            "lastfm_password",
+        );
         credentials = Some(LastfmCredentials {
             username: username.clone(),
             password: password.clone(),
@@ -213,10 +229,17 @@ fn main() {
                 }
 
                 if let Ok(mut scr) = scrobbler.lock() {
+                    info!(
+                        "Sending Last.fm scrobble: title='{}', artist='{}', album='{}'",
+                        pending_scrobble.title, pending_scrobble.artist, pending_scrobble.album
+                    );
                     match scr.scrobble(&scrobble) {
-                        Ok(_) => info!(
-                            "Scrobbled: {} - {}",
-                            pending_scrobble.artist, pending_scrobble.title
+                        Ok(response) => info!(
+                            "Last.fm accepted scrobble: title='{}', artist='{}', album='{}', timestamp={}",
+                            response.track.text,
+                            response.artist.text,
+                            response.album.text,
+                            response.timestamp
                         ),
                         Err(e) => {
                             let mut error_text = e.to_string();
@@ -225,10 +248,13 @@ fn main() {
                                 && reauthenticate_scrobbler(&mut scr, creds)
                             {
                                 match scr.scrobble(&scrobble) {
-                                    Ok(_) => {
+                                    Ok(response) => {
                                         info!(
-                                            "Scrobbled after re-auth: {} - {}",
-                                            pending_scrobble.artist, pending_scrobble.title
+                                            "Last.fm accepted scrobble after re-auth: title='{}', artist='{}', album='{}', timestamp={}",
+                                            response.track.text,
+                                            response.artist.text,
+                                            response.album.text,
+                                            response.timestamp
                                         );
                                         continue;
                                     }
@@ -276,6 +302,48 @@ fn main() {
         InputBackend::Dbus => run_native_dbus_input_loop(&state, scrobbler.as_ref()),
         InputBackend::Mpris => run_mpris_input_loop(&state, scrobbler.as_ref()),
     }
+}
+
+fn load_required_secret(env_key: &str, file_env_key: &str, cred_file_name: &str) -> String {
+    if let Ok(value) = env::var(env_key) {
+        return value;
+    }
+
+    let secret_path = env::var(file_env_key)
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("CREDENTIALS_DIRECTORY")
+                .ok()
+                .map(|dir| Path::new(&dir).join(cred_file_name))
+        });
+
+    let Some(secret_path) = secret_path else {
+        panic!(
+            "{} is missing. Set {}, {} or provide {} in CREDENTIALS_DIRECTORY.",
+            env_key, env_key, file_env_key, cred_file_name
+        );
+    };
+
+    let value = fs::read_to_string(&secret_path).unwrap_or_else(|err| {
+        panic!(
+            "Failed to read {} from {}: {}",
+            env_key,
+            secret_path.display(),
+            err
+        )
+    });
+
+    let value = value.trim_end_matches(['\n', '\r']).to_string();
+    if value.is_empty() {
+        panic!(
+            "{} credential file is empty: {}",
+            env_key,
+            secret_path.display()
+        );
+    }
+
+    value
 }
 
 fn parse_input_backend() -> InputBackend {
@@ -451,14 +519,7 @@ fn apply_playback_snapshot(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
-        if let Some(scrobbler) = scrobbler {
-            let track = Scrobble::new(&st.current.artist, &st.current.title, &st.current.album);
-            if let Ok(scr) = scrobbler.lock() {
-                let _ = scr.now_playing(&track);
-            }
-        } else {
-            debug!("Offline mode: skipping Last.fm now playing update.");
-        }
+        send_now_playing(scrobbler, &st.current);
     }
 }
 
@@ -477,14 +538,28 @@ fn process_xml_item(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
-        if let Some(scrobbler) = scrobbler {
-            let track = Scrobble::new(&st.current.artist, &st.current.title, &st.current.album);
-            if let Ok(scr) = scrobbler.lock() {
-                let _ = scr.now_playing(&track);
+        send_now_playing(scrobbler, &st.current);
+    }
+}
+
+fn send_now_playing(scrobbler: Option<&Arc<Mutex<Scrobbler>>>, track_info: &TrackInfo) {
+    if let Some(scrobbler) = scrobbler {
+        let track = Scrobble::new(&track_info.artist, &track_info.title, &track_info.album);
+        if let Ok(scr) = scrobbler.lock() {
+            info!(
+                "Sending Last.fm now playing: title='{}', artist='{}', album='{}'",
+                track_info.title, track_info.artist, track_info.album
+            );
+            match scr.now_playing(&track) {
+                Ok(response) => info!(
+                    "Last.fm accepted now playing: title='{}', artist='{}', album='{}'",
+                    response.track.text, response.artist.text, response.album.text
+                ),
+                Err(err) => warn!("Last.fm now playing rejected: {}", err),
             }
-        } else {
-            debug!("Offline mode: skipping Last.fm now playing update.");
         }
+    } else {
+        debug!("Offline mode: skipping Last.fm now playing update.");
     }
 }
 
@@ -809,6 +884,36 @@ fn pop_queued_scrobbles(
     queued_rows.collect::<Result<Vec<_>, rusqlite::Error>>()
 }
 
+fn increment_retry_count_for_queued_scrobbles(
+    conn: &mut SqliteConnection,
+    queued_scrobbles: &[QueuedScrobble],
+    error_text: &str,
+) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+    for queued in queued_scrobbles {
+        tx.execute(
+            "UPDATE scrobble_queue
+             SET retry_count = retry_count + 1, last_error = ?1
+             WHERE id = ?2",
+            params![error_text, queued.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn delete_queued_scrobbles(
+    conn: &mut SqliteConnection,
+    queued_scrobbles: &[QueuedScrobble],
+) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction()?;
+    for queued in queued_scrobbles {
+        tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn is_retriable_scrobble_error(error_text: &str) -> bool {
     let lowered = error_text.to_ascii_lowercase();
     lowered.contains("service offline")
@@ -861,13 +966,13 @@ fn retry_queued_scrobbles(
     let batch = ScrobbleBatch::from(batch_tracks);
 
     match scrobbler.scrobble_batch(&batch) {
-        Ok(_) => {
-            let tx = conn.transaction()?;
-            for queued in &queued_scrobbles {
-                tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
-            }
-            tx.commit()?;
-            info!("Retried queued scrobbles batch: {}", queued_scrobbles.len());
+        Ok(response) => {
+            delete_queued_scrobbles(conn, &queued_scrobbles)?;
+            info!(
+                "Last.fm accepted queued scrobble batch: accepted={}, requested={}",
+                response.scrobbles.len(),
+                queued_scrobbles.len()
+            );
             return Ok(());
         }
         Err(err) => {
@@ -877,14 +982,15 @@ fn retry_queued_scrobbles(
                 && reauthenticate_scrobbler(scrobbler, creds)
             {
                 match scrobbler.scrobble_batch(&batch) {
-                    Ok(_) => {
+                    Ok(response) => {
                         let tx = conn.transaction()?;
                         for queued in &queued_scrobbles {
                             tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
                         }
                         tx.commit()?;
                         info!(
-                            "Retried queued scrobbles batch after re-auth: {}",
+                            "Last.fm accepted queued scrobble batch after re-auth: accepted={}, requested={}",
+                            response.scrobbles.len(),
                             queued_scrobbles.len()
                         );
                         return Ok(());
@@ -892,16 +998,11 @@ fn retry_queued_scrobbles(
                     Err(retry_err) => {
                         let retry_error = retry_err.to_string();
                         if is_retriable_scrobble_error(&retry_error) {
-                            let tx = conn.transaction()?;
-                            for queued in &queued_scrobbles {
-                                tx.execute(
-                                    "UPDATE scrobble_queue
-                                     SET retry_count = retry_count + 1, last_error = ?1
-                                     WHERE id = ?2",
-                                    params![retry_error.as_str(), queued.id],
-                                )?;
-                            }
-                            tx.commit()?;
+                            increment_retry_count_for_queued_scrobbles(
+                                conn,
+                                &queued_scrobbles,
+                                retry_error.as_str(),
+                            )?;
                             return Ok(());
                         }
                     }
@@ -909,22 +1010,9 @@ fn retry_queued_scrobbles(
             }
 
             if is_retriable_scrobble_error(&error_text) {
-                let tx = conn.transaction()?;
-                for queued in &queued_scrobbles {
-                    tx.execute(
-                        "UPDATE scrobble_queue
-                         SET retry_count = retry_count + 1, last_error = ?1
-                         WHERE id = ?2",
-                        params![error_text.as_str(), queued.id],
-                    )?;
-                }
-                tx.commit()?;
+                increment_retry_count_for_queued_scrobbles(conn, &queued_scrobbles, error_text.as_str())?;
             } else {
-                let tx = conn.transaction()?;
-                for queued in &queued_scrobbles {
-                    tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
-                }
-                tx.commit()?;
+                delete_queued_scrobbles(conn, &queued_scrobbles)?;
                 warn!(
                     "Dropping non-retriable queued scrobble batch failure: {}",
                     error_text
@@ -939,10 +1027,10 @@ fn retry_queued_scrobbles(
 mod tests {
     use super::{
         MetadataItem, PendingScrobble, PlayerState, PlaybackSnapshot, apply_direct_playback_snapshot,
-        apply_metadata_item, decode_duration_ms, enqueue_failed_scrobble, hex_to_fourcc, init_queue,
-        is_playing_status, is_retriable_scrobble_error, is_truthy_flag, maybe_ready_for_scrobble,
-        parse_xml_item, pop_queued_scrobbles, queue_has_items, required_scrobble_play_time,
-        should_reauthenticate,
+        apply_metadata_item, decode_duration_ms, delete_queued_scrobbles, enqueue_failed_scrobble,
+        hex_to_fourcc, increment_retry_count_for_queued_scrobbles, init_queue, is_playing_status,
+        is_retriable_scrobble_error, is_truthy_flag, maybe_ready_for_scrobble, parse_xml_item,
+        pop_queued_scrobbles, queue_has_items, required_scrobble_play_time, should_reauthenticate,
     };
     use std::time::{Duration, Instant};
 
@@ -1087,6 +1175,99 @@ mod tests {
 
         assert!(!apply_metadata_item(&item, &mut state));
         assert_eq!(state.pending_duration, Some(Duration::from_millis(120_000)));
+    }
+
+    #[test]
+    fn metadata_reset_clears_pending_track_and_duration() {
+        let mut state = PlayerState::default();
+        state.pending.title = "Queued song".to_string();
+        state.pending.artist = "Queued artist".to_string();
+        state.pending.album = "Queued album".to_string();
+        state.pending_duration = Some(Duration::from_secs(90));
+
+        let reset_item = MetadataItem {
+            item_type: "ssnc".to_string(),
+            item_code: "mdst".to_string(),
+            decoded_text: String::new(),
+            decoded_bytes: Vec::new(),
+        };
+
+        assert!(!apply_metadata_item(&reset_item, &mut state));
+        assert_eq!(state.pending, super::TrackInfo::default());
+        assert_eq!(state.pending_duration, None);
+    }
+
+    #[test]
+    fn metadata_pause_and_resume_transitions_update_playing_state() {
+        let mut state = PlayerState::default();
+        state.is_playing = true;
+        state.segment_started_at = Some(Instant::now() - Duration::from_millis(20));
+
+        let pause_item = MetadataItem {
+            item_type: "ssnc".to_string(),
+            item_code: "pend".to_string(),
+            decoded_text: String::new(),
+            decoded_bytes: Vec::new(),
+        };
+        let resume_item = MetadataItem {
+            item_type: "ssnc".to_string(),
+            item_code: "prsm".to_string(),
+            decoded_text: String::new(),
+            decoded_bytes: Vec::new(),
+        };
+
+        assert!(!apply_metadata_item(&pause_item, &mut state));
+        assert!(!state.is_playing);
+        assert!(state.segment_started_at.is_none());
+        assert!(state.played_duration >= Duration::from_millis(1));
+        let played_after_pause = state.played_duration;
+
+        assert!(!apply_metadata_item(&resume_item, &mut state));
+        assert!(state.is_playing);
+        assert!(state.segment_started_at.is_some());
+        assert!(state.played_duration >= played_after_pause);
+    }
+
+    #[test]
+    fn retry_queue_helpers_increment_and_delete_rows() {
+        let mut conn = init_queue(":memory:").expect("queue init should work");
+
+        for idx in 0..2 {
+            let pending = PendingScrobble {
+                artist: "A".to_string(),
+                title: format!("Track-{idx}"),
+                album: "Album".to_string(),
+                played_at_unix: 1_000 + idx as u64,
+            };
+            enqueue_failed_scrobble(&mut conn, &pending, "initial")
+                .expect("enqueue should work");
+        }
+
+        let queued = pop_queued_scrobbles(&mut conn, 50).expect("read should work");
+        increment_retry_count_for_queued_scrobbles(&mut conn, &queued, "timeout")
+            .expect("retry increment should work");
+
+        let rows = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT retry_count, last_error
+                     FROM scrobble_queue
+                     ORDER BY id ASC",
+                )
+                .expect("query should prepare");
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows should collect")
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (1, "timeout".to_string()));
+        assert_eq!(rows[1], (1, "timeout".to_string()));
+
+        delete_queued_scrobbles(&mut conn, &queued).expect("delete should work");
+        assert!(!queue_has_items(&conn).expect("queue check should work"));
     }
 
     #[test]
