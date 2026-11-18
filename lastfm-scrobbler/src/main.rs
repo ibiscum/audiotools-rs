@@ -14,10 +14,11 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::sync::watch;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 struct TrackInfo {
@@ -67,131 +68,101 @@ struct LastfmCredentials {
 }
 
 struct LastfmScrobbler {
-    runtime: Runtime,
     base_writer: Writer,
     writer: Writer,
     credentials: LastfmCredentials,
 }
 
 impl LastfmScrobbler {
-    fn new(api_key: &str, api_secret: &str, credentials: LastfmCredentials) -> Self {
-        let runtime = TokioRuntimeBuilder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
+    async fn new(
+        api_key: &str,
+        api_secret: &str,
+        credentials: LastfmCredentials,
+    ) -> Result<Self, scrobl::Error> {
         let base_writer = scrobl::Client::builder(ApiKey::new(api_key))
             .secret(ApiSecret::new(api_secret))
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
-            .build_writer()
-            .expect("Failed to create Last.fm API writer");
-        let session = runtime
-            .block_on(
-                base_writer
-                    .auth()
-                    .mobile_session(
-                        credentials.username.as_str(),
-                        Password::new(credentials.password.as_str()),
-                    )
-                    .send(),
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build_writer()?;
+        let session = base_writer
+            .auth()
+            .mobile_session(
+                credentials.username.as_str(),
+                Password::new(credentials.password.as_str()),
             )
-            .expect("Last.fm authentication failed")
+            .send()
+            .await?
             .into_value();
         let writer = base_writer.with_session(session.into_key());
 
-        Self {
-            runtime,
+        Ok(Self {
             base_writer,
             writer,
             credentials,
-        }
+        })
     }
 
-    fn reauthenticate(&mut self) -> Result<(), scrobl::Error> {
-        let session = self.runtime.block_on(
-            self.base_writer
-                .auth()
-                .mobile_session(
-                    self.credentials.username.as_str(),
-                    Password::new(self.credentials.password.as_str()),
-                )
-                .send(),
-        )?;
-        self.writer = self.base_writer.with_session(session.into_value().into_key());
+    async fn reauthenticate(&mut self) -> Result<(), scrobl::Error> {
+        let session = self
+            .base_writer
+            .auth()
+            .mobile_session(
+                self.credentials.username.as_str(),
+                Password::new(self.credentials.password.as_str()),
+            )
+            .send()
+            .await?;
+        self.writer = self
+            .base_writer
+            .with_session(session.into_value().into_key());
         Ok(())
     }
 
-    fn retry_after_reauthentication<T>(
-        &mut self,
-        original_error: scrobl::Error,
-        retry: impl FnOnce(&Self) -> Result<T, scrobl::Error>,
-    ) -> Result<T, scrobl::Error> {
-        if let Err(auth_error) = self.reauthenticate() {
-            error!("Failed to re-authenticate with Last.fm: {}", auth_error);
-            return Err(original_error);
-        }
-        info!("Re-authenticated with Last.fm.");
-        retry(self)
-    }
-
-    fn scrobble(&mut self, play: &Play) -> Result<(usize, usize), scrobl::Error> {
-        match self.runtime.block_on(self.writer.scrobble(std::slice::from_ref(play)).send()) {
+    async fn scrobble_batch(&mut self, plays: &[Play]) -> Result<(usize, usize), scrobl::Error> {
+        match self.writer.scrobble(plays).send().await {
             Ok(response) => {
                 let report = response.into_value();
                 Ok((report.accepted(), report.ignored()))
             }
             Err(err) if should_reauthenticate(err.retry()) => {
-                self.retry_after_reauthentication(err, |this| {
-                    this.runtime
-                        .block_on(this.writer.scrobble(std::slice::from_ref(play)).send())
-                        .map(|response| {
-                            let report = response.into_value();
-                            (report.accepted(), report.ignored())
-                        })
+                if let Err(auth_error) = self.reauthenticate().await {
+                    error!("Failed to re-authenticate with Last.fm: {}", auth_error);
+                    return Err(err);
+                }
+                info!("Re-authenticated with Last.fm.");
+                self.writer.scrobble(plays).send().await.map(|response| {
+                    let report = response.into_value();
+                    (report.accepted(), report.ignored())
                 })
             }
             Err(err) => Err(err),
         }
     }
 
-    fn scrobble_batch(&mut self, plays: &[Play]) -> Result<(usize, usize), scrobl::Error> {
-        match self.runtime.block_on(self.writer.scrobble(plays).send()) {
-            Ok(response) => {
-                let report = response.into_value();
-                Ok((report.accepted(), report.ignored()))
-            }
-            Err(err) if should_reauthenticate(err.retry()) => {
-                self.retry_after_reauthentication(err, |this| {
-                    this.runtime
-                        .block_on(this.writer.scrobble(plays).send())
-                        .map(|response| {
-                            let report = response.into_value();
-                            (report.accepted(), report.ignored())
-                        })
-                })
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn now_playing(&mut self, track: &TrackInfo) -> Result<(), scrobl::Error> {
-        match self.runtime.block_on(
-            self.writer
-                .now_playing(track.artist.as_str(), track.title.as_str())
-                .album(track.album.as_str())
-                .send(),
-        ) {
+    async fn now_playing(&mut self, track: &TrackInfo) -> Result<(), scrobl::Error> {
+        match self
+            .writer
+            .now_playing(track.artist.as_str(), track.title.as_str())
+            .album(track.album.as_str())
+            .send()
+            .await
+        {
             Ok(_) => Ok(()),
             Err(err) if should_reauthenticate(err.retry()) => {
-                self.retry_after_reauthentication(err, |this| {
-                    this.runtime
-                        .block_on(
-                            this.writer
-                                .now_playing(track.artist.as_str(), track.title.as_str())
-                                .album(track.album.as_str())
-                                .send(),
-                        )
-                        .map(|_| ())
-                })
+                if let Err(auth_error) = self.reauthenticate().await {
+                    error!("Failed to re-authenticate with Last.fm: {}", auth_error);
+                    return Err(err);
+                }
+                info!("Re-authenticated with Last.fm.");
+                self.writer
+                    .now_playing(track.artist.as_str(), track.title.as_str())
+                    .album(track.album.as_str())
+                    .send()
+                    .await
+                    .map(|_| ())
             }
             Err(err) => Err(err),
         }
@@ -213,12 +184,49 @@ struct QueuedScrobble {
     title: String,
     album: String,
     played_at_unix: u64,
+    retry_count: i64,
+    last_error: Option<String>,
+    created_at_unix: i64,
 }
 
 #[derive(Clone, Copy)]
 enum DurationUnit {
     Millis,
     Micros,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueuePolicy {
+    busy_timeout: Duration,
+    queue_ttl: Duration,
+    dead_letter_ttl: Duration,
+    max_queue_items: i64,
+    max_retry_count: i64,
+}
+
+impl QueuePolicy {
+    fn from_env() -> Self {
+        let busy_timeout_ms = parse_env_u64("LASTFM_QUEUE_BUSY_TIMEOUT_MS", 5_000);
+        let queue_ttl_secs = parse_env_u64("LASTFM_QUEUE_TTL_SECS", 7 * 24 * 60 * 60);
+        let dead_letter_ttl_secs = parse_env_u64("LASTFM_DEAD_LETTER_TTL_SECS", 30 * 24 * 60 * 60);
+        let max_queue_items = parse_env_i64("LASTFM_QUEUE_MAX_ITEMS", 10_000);
+        let max_retry_count = parse_env_i64("LASTFM_QUEUE_MAX_RETRIES", 20);
+
+        if max_queue_items <= 0 {
+            panic!("LASTFM_QUEUE_MAX_ITEMS must be greater than zero.");
+        }
+        if max_retry_count <= 0 {
+            panic!("LASTFM_QUEUE_MAX_RETRIES must be greater than zero.");
+        }
+
+        Self {
+            busy_timeout: Duration::from_millis(busy_timeout_ms),
+            queue_ttl: Duration::from_secs(queue_ttl_secs),
+            dead_letter_ttl: Duration::from_secs(dead_letter_ttl_secs),
+            max_queue_items,
+            max_retry_count,
+        }
+    }
 }
 
 impl Default for PlayerState {
@@ -259,159 +267,245 @@ fn main() {
         env::var("SHAIRPORT_PIPE").unwrap_or_else(|_| "/tmp/shairport-sync-metadata".to_string());
     let queue_db_path = env::var("LASTFM_QUEUE_DB")
         .unwrap_or_else(|_| "/var/lib/shairport-scrobbler/scrobble-queue.sqlite3".to_string());
+    let queue_policy = QueuePolicy::from_env();
     let offline_mode = env::var("LASTFM_OFFLINE_MODE")
         .ok()
         .is_some_and(|value| is_truthy_flag(&value));
 
-    let scrobbler = if offline_mode {
+    let scrobbler_config = if offline_mode {
         info!("Last.fm offline mode enabled; skipping authentication and API calls.");
         None
     } else {
-        let api_key = load_required_secret(
-            "LASTFM_API_KEY",
-            "LASTFM_API_KEY_FILE",
-            "lastfm_api_key",
-        );
+        let api_key =
+            load_required_secret("LASTFM_API_KEY", "LASTFM_API_KEY_FILE", "lastfm_api_key");
         let api_secret = load_required_secret(
             "LASTFM_API_SECRET",
             "LASTFM_API_SECRET_FILE",
             "lastfm_api_secret",
         );
-        let username = load_required_secret(
-            "LASTFM_USERNAME",
-            "LASTFM_USERNAME_FILE",
-            "lastfm_username",
-        );
-        let password = load_required_secret(
-            "LASTFM_PASSWORD",
-            "LASTFM_PASSWORD_FILE",
-            "lastfm_password",
-        );
-        let credentials = LastfmCredentials {
-            username: username.clone(),
-            password: password.clone(),
-        };
-
-        let scrobbler = LastfmScrobbler::new(&api_key, &api_secret, credentials);
-        info!("Successfully authenticated with Last.fm.");
-        Some(Arc::new(Mutex::new(scrobbler)))
+        let username =
+            load_required_secret("LASTFM_USERNAME", "LASTFM_USERNAME_FILE", "lastfm_username");
+        let password =
+            load_required_secret("LASTFM_PASSWORD", "LASTFM_PASSWORD_FILE", "lastfm_password");
+        Some((
+            api_key,
+            api_secret,
+            LastfmCredentials { username, password },
+        ))
     };
 
     let state = Arc::new(Mutex::new(PlayerState::default()));
-
-    let bg_state = Arc::clone(&state);
-    let bg_scrobbler = scrobbler.clone();
-    let mut queue_conn = if offline_mode {
+    let queue_conn = if offline_mode {
         None
     } else {
         Some(
-            init_queue(&queue_db_path)
+            init_queue(&queue_db_path, queue_policy)
                 .unwrap_or_else(|err| panic!("Failed to initialize scrobble queue: {}", err)),
         )
     };
-    thread::spawn(move || {
-        let mut last_queue_retry = Instant::now();
-
-        loop {
-            thread::sleep(Duration::from_secs(1));
-
-            if let (Some(scrobbler), Some(conn)) = (&bg_scrobbler, queue_conn.as_mut()) {
-                let has_backlog = queue_has_items(conn).unwrap_or(false);
-                if has_backlog && last_queue_retry.elapsed() >= Duration::from_secs(15) {
-                    if let Ok(mut scr) = scrobbler.lock()
-                        && let Err(err) = retry_queued_scrobbles(conn, &mut scr)
-                    {
-                        error!("Queue retry error: {}", err);
+    let (now_playing_tx, now_playing_rx) = watch::channel(None);
+    let runtime = TokioRuntimeBuilder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+    let (worker_ready_tx, worker_ready_rx) = mpsc::sync_channel(1);
+    let worker_state = Arc::clone(&state);
+    runtime.spawn(async move {
+        let scrobbler = match scrobbler_config {
+            Some((api_key, api_secret, credentials)) => {
+                match LastfmScrobbler::new(&api_key, &api_secret, credentials).await {
+                    Ok(scrobbler) => Some(scrobbler),
+                    Err(err) => {
+                        let _ = worker_ready_tx.send(Err(err.to_string()));
+                        return;
                     }
-                    last_queue_retry = Instant::now();
                 }
             }
+            None => None,
+        };
 
-            let pending_scrobble = {
-                let mut st = bg_state.lock().unwrap();
-                maybe_ready_for_scrobble(&mut st)
-            };
+        if worker_ready_tx.send(Ok(())).is_err() {
+            return;
+        }
+        if scrobbler.is_some() {
+            info!("Successfully authenticated with Last.fm.");
+        }
+        run_lastfm_worker(
+            worker_state,
+            now_playing_rx,
+            queue_conn,
+            scrobbler,
+            queue_policy,
+        )
+        .await;
+    });
 
-            let Some(pending_scrobble) = pending_scrobble else {
-                continue;
-            };
+    worker_ready_rx
+        .recv()
+        .expect("Last.fm worker stopped before startup")
+        .unwrap_or_else(|err| panic!("Last.fm authentication failed: {}", err));
+    let now_playing = (!offline_mode).then_some(&now_playing_tx);
 
-            let scrobble = Play::new(
-                &pending_scrobble.artist,
-                &pending_scrobble.title,
-                pending_scrobble.played_at_unix,
-            )
-            .album(&pending_scrobble.album);
+    match input_backend {
+        InputBackend::Pipe => run_pipe_input_loop(&pipe_path, &state, now_playing),
+        InputBackend::Dbus => run_native_dbus_input_loop(&state, now_playing),
+        InputBackend::Mpris => run_mpris_input_loop(&state, now_playing),
+    }
+}
 
-            if let Some(scrobbler) = &bg_scrobbler {
-                if let Some(conn) = queue_conn.as_mut()
-                    && queue_has_items(conn).unwrap_or(false)
+async fn run_lastfm_worker(
+    state: Arc<Mutex<PlayerState>>,
+    mut now_playing_rx: watch::Receiver<Option<TrackInfo>>,
+    mut queue_conn: Option<SqliteConnection>,
+    mut scrobbler: Option<LastfmScrobbler>,
+    queue_policy: QueuePolicy,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    let mut last_queue_retry = Instant::now();
+
+    loop {
+        tokio::select! {
+            changed = now_playing_rx.changed(), if scrobbler.is_some() => {
+                if changed.is_err() {
+                    break;
+                }
+                let track = now_playing_rx.borrow_and_update().clone();
+                if let Some(track) = track
+                    && let Some(scrobbler) = scrobbler.as_mut()
                 {
-                    if let Err(queue_err) = enqueue_failed_scrobble(
-                        conn,
-                        &pending_scrobble,
-                        "queued_due_to_backlog",
-                    ) {
-                        error!("Failed to persist queued scrobble: {}", queue_err);
+                    info!(
+                        "Sending Last.fm now playing: title='{}', artist='{}', album='{}'",
+                        track.title, track.artist, track.album
+                    );
+                    match scrobbler.now_playing(&track).await {
+                        Ok(()) => info!(
+                            "Last.fm accepted now playing: title='{}', artist='{}', album='{}'",
+                            track.title, track.artist, track.album
+                        ),
+                        Err(err) => warn!("Last.fm now playing rejected: {}", err),
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                let pending_scrobble = {
+                    let mut state = state.lock().unwrap();
+                    maybe_ready_for_scrobble(&mut state)
+                };
+                let Some(pending_scrobble) = pending_scrobble else {
+                    if let (Some(scrobbler), Some(conn)) =
+                        (scrobbler.as_mut(), queue_conn.as_mut())
+                        && last_queue_retry.elapsed() >= Duration::from_secs(15)
+                    {
+                        if let Err(err) = apply_queue_retention(conn, &queue_policy) {
+                            error!("Queue retention error: {}", err);
+                        }
+                        match queue_has_items(conn) {
+                            Ok(true) => {
+                                if let Err(err) =
+                                    retry_queued_scrobbles(conn, scrobbler, &queue_policy).await
+                                {
+                                    error!("Queue retry error: {}", err);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(err) => error!("Failed to inspect scrobble queue: {}", err),
+                        }
+                        last_queue_retry = Instant::now();
                     }
                     continue;
-                }
+                };
 
-                if let Ok(mut scr) = scrobbler.lock() {
-                    info!(
-                        "Sending Last.fm scrobble: title='{}', artist='{}', album='{}'",
-                        pending_scrobble.title, pending_scrobble.artist, pending_scrobble.album
+                let Some(scrobbler) = scrobbler.as_mut() else {
+                    debug!(
+                        "Offline mode: skipping scrobble for {} - {}",
+                        pending_scrobble.artist, pending_scrobble.title
                     );
-                    match scr.scrobble(&scrobble) {
-                        Ok((1, ignored)) => info!(
-                            "Last.fm accepted scrobble: title='{}', artist='{}', album='{}', timestamp={} (ignored={})",
-                            pending_scrobble.title, pending_scrobble.artist, pending_scrobble.album,
-                            pending_scrobble.played_at_unix, ignored
-                        ),
-                        Ok((accepted, ignored)) => warn!(
-                            "Last.fm did not accept scrobble: title='{}', artist='{}', album='{}', accepted={}, ignored={}",
-                            pending_scrobble.title, pending_scrobble.artist, pending_scrobble.album,
-                            accepted, ignored
-                        ),
-                        Err(e) => {
-                            let error_text = e.to_string();
-                            let is_retriable = is_retriable_scrobble_error(e.retry());
-                            warn!(
-                                "Scrobble error: {}; queueing decision for {} - {}",
-                                error_text, pending_scrobble.artist, pending_scrobble.title
-                            );
-                            if is_retriable {
-                                if let Some(conn) = queue_conn.as_mut()
-                                    && let Err(queue_err) = enqueue_failed_scrobble(
-                                        conn,
-                                        &pending_scrobble,
-                                        &error_text,
-                                    )
-                                {
-                                    error!("Failed to persist queued scrobble: {}", queue_err);
+                    continue;
+                };
+
+                info!(
+                    "Sending Last.fm scrobble: title='{}', artist='{}', album='{}'",
+                    pending_scrobble.title, pending_scrobble.artist, pending_scrobble.album
+                );
+                let play = Play::new(
+                    &pending_scrobble.artist,
+                    &pending_scrobble.title,
+                    pending_scrobble.played_at_unix,
+                )
+                .album(&pending_scrobble.album);
+
+                match scrobbler.scrobble_batch(std::slice::from_ref(&play)).await {
+                    Ok((1, ignored)) => info!(
+                        "Last.fm accepted scrobble: title='{}', artist='{}', album='{}', timestamp={} (ignored={})",
+                        pending_scrobble.title,
+                        pending_scrobble.artist,
+                        pending_scrobble.album,
+                        pending_scrobble.played_at_unix,
+                        ignored
+                    ),
+                    Ok((accepted, ignored)) => warn!(
+                        "Last.fm did not accept scrobble: title='{}', artist='{}', album='{}', accepted={}, ignored={}",
+                        pending_scrobble.title,
+                        pending_scrobble.artist,
+                        pending_scrobble.album,
+                        accepted,
+                        ignored
+                    ),
+                    Err(err) => {
+                        let error_text = err.to_string();
+                        if is_retriable_scrobble_error(err.retry()) {
+                            if let Some(conn) = queue_conn.as_mut() {
+                                if let Err(queue_err) = enqueue_scrobble(
+                                    conn,
+                                    &pending_scrobble,
+                                    Some(error_text.as_str()),
+                                ) {
+                                    error!("Failed to queue retriable scrobble: {}", queue_err);
+                                    reset_scrobble_state_if_current(&state, &pending_scrobble);
+                                } else {
+                                    if let Err(retention_err) = apply_queue_retention(conn, &queue_policy)
+                                    {
+                                        error!("Queue retention error: {}", retention_err);
+                                    }
+                                    warn!(
+                                        "Queued retriable scrobble after send failure: {}",
+                                        error_text
+                                    );
                                 }
                             } else {
-                                warn!(
-                                    "Not retrying non-retriable scrobble failure for {} - {}: {}",
-                                    pending_scrobble.artist, pending_scrobble.title, error_text
+                                error!(
+                                    "Retriable scrobble failure without durable queue availability: {}",
+                                    error_text
                                 );
+                                reset_scrobble_state_if_current(&state, &pending_scrobble);
                             }
+                        } else {
+                            warn!(
+                                "Not retrying non-retriable scrobble failure for {} - {}: {}",
+                                pending_scrobble.artist, pending_scrobble.title, error_text
+                            );
                         }
                     }
                 }
-            } else {
-                debug!(
-                    "Offline mode: skipping scrobble for {} - {}",
-                    pending_scrobble.artist, pending_scrobble.title
-                );
             }
         }
-    });
+    }
+}
 
-    match input_backend {
-        InputBackend::Pipe => run_pipe_input_loop(&pipe_path, &state, scrobbler.as_ref()),
-        InputBackend::Dbus => run_native_dbus_input_loop(&state, scrobbler.as_ref()),
-        InputBackend::Mpris => run_mpris_input_loop(&state, scrobbler.as_ref()),
+fn reset_scrobble_state_if_current(
+    state: &Arc<Mutex<PlayerState>>,
+    pending_scrobble: &PendingScrobble,
+) {
+    let mut state = state.lock().unwrap();
+    if state.track_started_unix == Some(pending_scrobble.played_at_unix)
+        && state.current.artist == pending_scrobble.artist
+        && state.current.title == pending_scrobble.title
+        && state.current.album == pending_scrobble.album
+    {
+        state.scrobbled = false;
     }
 }
 
@@ -420,14 +514,11 @@ fn load_required_secret(env_key: &str, file_env_key: &str, cred_file_name: &str)
         return value;
     }
 
-    let secret_path = env::var(file_env_key)
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var("CREDENTIALS_DIRECTORY")
-                .ok()
-                .map(|dir| Path::new(&dir).join(cred_file_name))
-        });
+    let secret_path = env::var(file_env_key).ok().map(PathBuf::from).or_else(|| {
+        env::var("CREDENTIALS_DIRECTORY")
+            .ok()
+            .map(|dir| Path::new(&dir).join(cred_file_name))
+    });
 
     let Some(secret_path) = secret_path else {
         panic!(
@@ -457,6 +548,24 @@ fn load_required_secret(env_key: &str, file_env_key: &str, cred_file_name: &str)
     value
 }
 
+fn parse_env_u64(env_key: &str, default: u64) -> u64 {
+    match env::var(env_key) {
+        Ok(value) => value.parse::<u64>().unwrap_or_else(|_| {
+            panic!("{} must be an unsigned integer; got {:?}.", env_key, value)
+        }),
+        Err(_) => default,
+    }
+}
+
+fn parse_env_i64(env_key: &str, default: i64) -> i64 {
+    match env::var(env_key) {
+        Ok(value) => value
+            .parse::<i64>()
+            .unwrap_or_else(|_| panic!("{} must be an integer; got {:?}.", env_key, value)),
+        Err(_) => default,
+    }
+}
+
 fn parse_input_backend() -> InputBackend {
     let input_backend = env::var("LASTFM_INPUT_BACKEND").unwrap_or_else(|_| "pipe".to_string());
     match input_backend.trim().to_ascii_lowercase().as_str() {
@@ -473,7 +582,7 @@ fn parse_input_backend() -> InputBackend {
 fn run_pipe_input_loop(
     pipe_path: &str,
     state: &Arc<Mutex<PlayerState>>,
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) -> ! {
     loop {
         debug!("Opening pipe: {}", pipe_path);
@@ -497,7 +606,7 @@ fn run_pipe_input_loop(
             item_buffer.push_str(&line);
 
             if line.trim_end().ends_with("</item>") {
-                process_xml_item(&item_buffer, state, scrobbler);
+                process_xml_item(&item_buffer, state, now_playing);
                 item_buffer.clear();
             }
             line.clear();
@@ -507,12 +616,14 @@ fn run_pipe_input_loop(
 
 fn run_mpris_input_loop(
     state: &Arc<Mutex<PlayerState>>,
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) -> ! {
     let bus = env::var("MPRIS_BUS").unwrap_or_else(|_| "system".to_string());
     let nametag = env::var("SHAIRPORT_DBUS_NAMETAG").ok();
     let default_service = match nametag {
-        Some(tag) if !tag.trim().is_empty() => format!("org.mpris.MediaPlayer2.ShairportSync.{tag}"),
+        Some(tag) if !tag.trim().is_empty() => {
+            format!("org.mpris.MediaPlayer2.ShairportSync.{tag}")
+        }
         _ => "org.mpris.MediaPlayer2.ShairportSync".to_string(),
     };
     let service = env::var("MPRIS_SERVICE").unwrap_or(default_service);
@@ -526,7 +637,7 @@ fn run_mpris_input_loop(
 
     loop {
         match read_mpris_snapshot(&conn, &service, &path) {
-            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, scrobbler),
+            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, now_playing),
             Err(err) => warn!("MPRIS read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
@@ -535,7 +646,7 @@ fn run_mpris_input_loop(
 
 fn run_native_dbus_input_loop(
     state: &Arc<Mutex<PlayerState>>,
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) -> ! {
     let bus = env::var("SHAIRPORT_DBUS_BUS").unwrap_or_else(|_| "system".to_string());
     let nametag = env::var("SHAIRPORT_DBUS_NAMETAG").ok();
@@ -544,7 +655,8 @@ fn run_native_dbus_input_loop(
         _ => "org.gnome.ShairportSync".to_string(),
     };
     let service = env::var("SHAIRPORT_DBUS_SERVICE").unwrap_or(default_service);
-    let path = env::var("SHAIRPORT_DBUS_PATH").unwrap_or_else(|_| "/org/gnome/ShairportSync".to_string());
+    let path =
+        env::var("SHAIRPORT_DBUS_PATH").unwrap_or_else(|_| "/org/gnome/ShairportSync".to_string());
     let conn = open_dbus_connection(&bus);
 
     info!(
@@ -554,7 +666,7 @@ fn run_native_dbus_input_loop(
 
     loop {
         match read_native_dbus_snapshot(&conn, &service, &path) {
-            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, scrobbler),
+            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, now_playing),
             Err(err) => warn!("DBus read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
@@ -584,7 +696,10 @@ fn read_mpris_snapshot(
         album: propmap_first_string(&metadata, &["xesam:album", "album"]).unwrap_or_default(),
         duration: propmap_duration(
             &metadata,
-            &[("mpris:length", DurationUnit::Micros), ("duration", DurationUnit::Millis)],
+            &[
+                ("mpris:length", DurationUnit::Micros),
+                ("duration", DurationUnit::Millis),
+            ],
         ),
         is_playing: is_playing_status(&status),
     })
@@ -622,7 +737,7 @@ fn read_native_dbus_snapshot(
 fn apply_playback_snapshot(
     snapshot: &PlaybackSnapshot,
     state: &Arc<Mutex<PlayerState>>,
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) {
     let mut st = state.lock().unwrap();
     if apply_direct_playback_snapshot(snapshot, &mut st) {
@@ -630,14 +745,14 @@ fn apply_playback_snapshot(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
-        send_now_playing(scrobbler, &st.current);
+        send_now_playing(now_playing, &st.current);
     }
 }
 
 fn process_xml_item(
     xml: &str,
     state: &Arc<Mutex<PlayerState>>,
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) {
     let item = match parse_xml_item(xml) {
         Ok(item) => item,
@@ -653,36 +768,26 @@ fn process_xml_item(
             "Now Playing: {} - {} ({})",
             st.current.artist, st.current.title, st.current.album
         );
-        send_now_playing(scrobbler, &st.current);
+        send_now_playing(now_playing, &st.current);
     }
 }
 
 fn send_now_playing(
-    scrobbler: Option<&Arc<Mutex<LastfmScrobbler>>>,
+    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
     track_info: &TrackInfo,
 ) {
-    if let Some(scrobbler) = scrobbler {
-        if let Ok(mut scr) = scrobbler.lock() {
-            info!(
-                "Sending Last.fm now playing: title='{}', artist='{}', album='{}'",
-                track_info.title, track_info.artist, track_info.album
-            );
-            match scr.now_playing(track_info) {
-                Ok(()) => info!(
-                    "Last.fm accepted now playing: title='{}', artist='{}', album='{}'",
-                    track_info.title, track_info.artist, track_info.album
-                ),
-                Err(err) => warn!("Last.fm now playing rejected: {}", err),
-            }
-        }
+    if let Some(sender) = now_playing {
+        sender.send_replace(Some(track_info.clone()));
     } else {
         debug!("Offline mode: skipping Last.fm now playing update.");
     }
 }
 
 fn propmap_first_string(map: &PropMap, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| map.get(*key).and_then(|value| refarg_to_string(value.0.as_ref())))
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(|value| refarg_to_string(value.0.as_ref()))
+    })
 }
 
 fn propmap_duration(map: &PropMap, keys: &[(&str, DurationUnit)]) -> Option<Duration> {
@@ -714,8 +819,7 @@ fn refarg_to_i64(arg: &dyn RefArg) -> Option<i64> {
 }
 
 fn is_playing_status(status: &str) -> bool {
-    status.trim().eq_ignore_ascii_case("playing")
-        || status.trim().eq_ignore_ascii_case("play")
+    status.trim().eq_ignore_ascii_case("playing") || status.trim().eq_ignore_ascii_case("play")
 }
 
 fn apply_direct_playback_snapshot(snapshot: &PlaybackSnapshot, st: &mut PlayerState) -> bool {
@@ -789,14 +893,17 @@ fn required_scrobble_play_time(track_duration: Option<Duration>) -> Option<Durat
 }
 
 fn effective_played_duration(st: &PlayerState) -> Duration {
-    if st.is_playing && let Some(segment_started_at) = st.segment_started_at {
+    if st.is_playing
+        && let Some(segment_started_at) = st.segment_started_at
+    {
         return st.played_duration + segment_started_at.elapsed();
     }
     st.played_duration
 }
 
 fn set_playing_state(st: &mut PlayerState, is_playing: bool) {
-    if st.is_playing && !is_playing
+    if st.is_playing
+        && !is_playing
         && let Some(segment_started_at) = st.segment_started_at.take()
     {
         st.played_duration += segment_started_at.elapsed();
@@ -925,7 +1032,9 @@ fn parse_xml_item(xml: &str) -> Result<MetadataItem, String> {
             .decode(encoded_data)
             .map_err(|err| format!("metadata item contains invalid Base64 data: {err}"))?
     };
-    let decoded_text = String::from_utf8(decoded_bytes.clone()).ok().unwrap_or_default();
+    let decoded_text = String::from_utf8(decoded_bytes.clone())
+        .ok()
+        .unwrap_or_default();
 
     Ok(MetadataItem {
         item_type,
@@ -984,13 +1093,21 @@ fn apply_metadata_item(item: &MetadataItem, st: &mut PlayerState) -> bool {
     false
 }
 
-fn init_queue(path: &str) -> Result<SqliteConnection, String> {
+fn init_queue(path: &str, policy: QueuePolicy) -> Result<SqliteConnection, String> {
     let queue_path = Path::new(path);
-    if let Some(parent) = queue_path.parent() && !parent.as_os_str().is_empty() {
+    if let Some(parent) = queue_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
     let conn = SqliteConnection::open(queue_path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(policy.busy_timeout)
+        .map_err(|e| e.to_string())?;
+    if path != ":memory:" {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS scrobble_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1005,14 +1122,41 @@ fn init_queue(path: &str) -> Result<SqliteConnection, String> {
         [],
     )
     .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dead_letter_scrobbles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_row_id INTEGER,
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            album TEXT NOT NULL,
+            played_at_unix INTEGER NOT NULL,
+            retry_count INTEGER NOT NULL,
+            last_error TEXT,
+            created_at_unix INTEGER NOT NULL,
+            dead_letter_reason TEXT NOT NULL,
+            dead_lettered_at_unix INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scrobble_queue_created_at ON scrobble_queue(created_at_unix)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dead_lettered_at ON dead_letter_scrobbles(dead_lettered_at_unix)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(conn)
 }
 
-fn enqueue_failed_scrobble(
+fn enqueue_scrobble(
     conn: &mut SqliteConnection,
     track: &PendingScrobble,
-    error: &str,
+    last_error: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT INTO scrobble_queue
@@ -1023,7 +1167,7 @@ fn enqueue_failed_scrobble(
             track.title,
             track.album,
             track.played_at_unix as i64,
-            error,
+            last_error,
             current_unix_timestamp() as i64
         ],
     )?;
@@ -1040,7 +1184,7 @@ fn pop_queued_scrobbles(
     limit: i64,
 ) -> Result<Vec<QueuedScrobble>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, artist, title, album, played_at_unix
+        "SELECT id, artist, title, album, played_at_unix, retry_count, last_error, created_at_unix
          FROM scrobble_queue
          ORDER BY id ASC
          LIMIT ?1",
@@ -1052,10 +1196,178 @@ fn pop_queued_scrobbles(
             title: row.get(2)?,
             album: row.get(3)?,
             played_at_unix: row.get::<_, i64>(4)? as u64,
+            retry_count: row.get(5)?,
+            last_error: row.get(6)?,
+            created_at_unix: row.get(7)?,
         })
     })?;
 
     queued_rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+}
+
+fn move_queued_scrobbles_to_dead_letter(
+    conn: &mut SqliteConnection,
+    queued_scrobbles: &[QueuedScrobble],
+    dead_letter_reason: &str,
+    last_error: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    if queued_scrobbles.is_empty() {
+        return Ok(());
+    }
+
+    let dead_lettered_at_unix = current_unix_timestamp() as i64;
+    let tx = conn.transaction()?;
+    for queued in queued_scrobbles {
+        tx.execute(
+            "INSERT INTO dead_letter_scrobbles (
+                queue_row_id, artist, title, album, played_at_unix, retry_count,
+                last_error, created_at_unix, dead_letter_reason, dead_lettered_at_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, ?8), ?9, ?10, ?11)",
+            params![
+                queued.id,
+                queued.artist,
+                queued.title,
+                queued.album,
+                queued.played_at_unix as i64,
+                queued.retry_count,
+                last_error,
+                queued.last_error.as_deref(),
+                queued.created_at_unix,
+                dead_letter_reason,
+                dead_lettered_at_unix
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM scrobble_queue WHERE id = ?1",
+            params![queued.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn move_expired_queued_scrobbles_to_dead_letter(
+    conn: &mut SqliteConnection,
+    min_created_at_unix: i64,
+) -> Result<usize, rusqlite::Error> {
+    let expired = {
+        let mut stmt = conn.prepare(
+            "SELECT id, artist, title, album, played_at_unix, retry_count, last_error, created_at_unix
+             FROM scrobble_queue
+             WHERE created_at_unix < ?1
+             ORDER BY id ASC",
+        )?;
+        stmt.query_map(params![min_created_at_unix], |row| {
+            Ok(QueuedScrobble {
+                id: row.get(0)?,
+                artist: row.get(1)?,
+                title: row.get(2)?,
+                album: row.get(3)?,
+                played_at_unix: row.get::<_, i64>(4)? as u64,
+                retry_count: row.get(5)?,
+                last_error: row.get(6)?,
+                created_at_unix: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let count = expired.len();
+    move_queued_scrobbles_to_dead_letter(conn, &expired, "expired_ttl", None)?;
+    Ok(count)
+}
+
+fn move_excess_queued_scrobbles_to_dead_letter(
+    conn: &mut SqliteConnection,
+    max_queue_items: i64,
+) -> Result<usize, rusqlite::Error> {
+    let total: i64 = conn.query_row("SELECT COUNT(1) FROM scrobble_queue", [], |row| row.get(0))?;
+    if total <= max_queue_items {
+        return Ok(0);
+    }
+
+    let overflow = total - max_queue_items;
+    let overflow_rows = pop_queued_scrobbles(conn, overflow)?;
+    let count = overflow_rows.len();
+    move_queued_scrobbles_to_dead_letter(conn, &overflow_rows, "queue_capacity_exceeded", None)?;
+    Ok(count)
+}
+
+fn move_retry_exhausted_scrobbles_to_dead_letter(
+    conn: &mut SqliteConnection,
+    max_retry_count: i64,
+) -> Result<usize, rusqlite::Error> {
+    let exhausted = {
+        let mut stmt = conn.prepare(
+            "SELECT id, artist, title, album, played_at_unix, retry_count, last_error, created_at_unix
+             FROM scrobble_queue
+             WHERE retry_count >= ?1
+             ORDER BY id ASC",
+        )?;
+        stmt.query_map(params![max_retry_count], |row| {
+            Ok(QueuedScrobble {
+                id: row.get(0)?,
+                artist: row.get(1)?,
+                title: row.get(2)?,
+                album: row.get(3)?,
+                played_at_unix: row.get::<_, i64>(4)? as u64,
+                retry_count: row.get(5)?,
+                last_error: row.get(6)?,
+                created_at_unix: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let count = exhausted.len();
+    move_queued_scrobbles_to_dead_letter(conn, &exhausted, "max_retries_exceeded", None)?;
+    Ok(count)
+}
+
+fn purge_expired_dead_letters(
+    conn: &mut SqliteConnection,
+    min_dead_lettered_at_unix: i64,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM dead_letter_scrobbles WHERE dead_lettered_at_unix < ?1",
+        params![min_dead_lettered_at_unix],
+    )
+}
+
+fn apply_queue_retention(
+    conn: &mut SqliteConnection,
+    queue_policy: &QueuePolicy,
+) -> Result<(), rusqlite::Error> {
+    let now_unix = current_unix_timestamp() as i64;
+    let min_created_at = now_unix - queue_policy.queue_ttl.as_secs() as i64;
+    let min_dead_lettered_at = now_unix - queue_policy.dead_letter_ttl.as_secs() as i64;
+
+    let expired_count = move_expired_queued_scrobbles_to_dead_letter(conn, min_created_at)?;
+    if expired_count > 0 {
+        warn!(
+            "Moved {} expired queued scrobbles to dead letter queue.",
+            expired_count
+        );
+    }
+
+    let overflow_count =
+        move_excess_queued_scrobbles_to_dead_letter(conn, queue_policy.max_queue_items)?;
+    if overflow_count > 0 {
+        warn!(
+            "Moved {} queued scrobbles to dead letter queue due to queue capacity.",
+            overflow_count
+        );
+    }
+
+    let purged_dead_letters = purge_expired_dead_letters(conn, min_dead_lettered_at)?;
+    if purged_dead_letters > 0 {
+        info!(
+            "Purged {} expired dead letter queue rows.",
+            purged_dead_letters
+        );
+    }
+
+    Ok(())
 }
 
 fn increment_retry_count_for_queued_scrobbles(
@@ -1082,7 +1394,10 @@ fn delete_queued_scrobbles(
 ) -> Result<(), rusqlite::Error> {
     let tx = conn.transaction()?;
     for queued in queued_scrobbles {
-        tx.execute("DELETE FROM scrobble_queue WHERE id = ?1", params![queued.id])?;
+        tx.execute(
+            "DELETE FROM scrobble_queue WHERE id = ?1",
+            params![queued.id],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -1099,9 +1414,10 @@ fn should_reauthenticate(retry: Retry) -> bool {
     retry == Retry::AfterReauthentication
 }
 
-fn retry_queued_scrobbles(
+async fn retry_queued_scrobbles(
     conn: &mut SqliteConnection,
     scrobbler: &mut LastfmScrobbler,
+    queue_policy: &QueuePolicy,
 ) -> Result<(), rusqlite::Error> {
     let queued_scrobbles = pop_queued_scrobbles(conn, 50)?;
     if queued_scrobbles.is_empty() {
@@ -1115,7 +1431,7 @@ fn retry_queued_scrobbles(
         })
         .collect::<Vec<_>>();
 
-    match scrobbler.scrobble_batch(&plays) {
+    match scrobbler.scrobble_batch(&plays).await {
         Ok((accepted, ignored)) => {
             delete_queued_scrobbles(conn, &queued_scrobbles)?;
             info!(
@@ -1128,11 +1444,34 @@ fn retry_queued_scrobbles(
         Err(err) => {
             let error_text = err.to_string();
             if is_retriable_scrobble_error(err.retry()) {
-                increment_retry_count_for_queued_scrobbles(conn, &queued_scrobbles, error_text.as_str())?;
-            } else {
-                delete_queued_scrobbles(conn, &queued_scrobbles)?;
+                increment_retry_count_for_queued_scrobbles(
+                    conn,
+                    &queued_scrobbles,
+                    error_text.as_str(),
+                )?;
                 warn!(
-                    "Dropping non-retriable queued scrobble batch failure: {}",
+                    "Retrying queued scrobble batch after retryable failure: {}",
+                    error_text
+                );
+                let exhausted = move_retry_exhausted_scrobbles_to_dead_letter(
+                    conn,
+                    queue_policy.max_retry_count,
+                )?;
+                if exhausted > 0 {
+                    warn!(
+                        "Moved {} queued scrobbles to dead letter queue after retry limit.",
+                        exhausted
+                    );
+                }
+            } else {
+                move_queued_scrobbles_to_dead_letter(
+                    conn,
+                    &queued_scrobbles,
+                    "non_retriable_failure",
+                    Some(error_text.as_str()),
+                )?;
+                warn!(
+                    "Moved non-retriable queued scrobble batch to dead letter queue: {}",
                     error_text
                 );
             }
@@ -1144,14 +1483,27 @@ fn retry_queued_scrobbles(
 #[cfg(test)]
 mod tests {
     use super::{
-        MetadataItem, PendingScrobble, PlayerState, PlaybackSnapshot, apply_direct_playback_snapshot,
-        apply_metadata_item, decode_duration_ms, delete_queued_scrobbles, enqueue_failed_scrobble,
-        hex_to_fourcc, increment_retry_count_for_queued_scrobbles, init_queue, is_playing_status,
-        is_retriable_scrobble_error, is_truthy_flag, maybe_ready_for_scrobble, parse_xml_item,
-        pop_queued_scrobbles, queue_has_items, required_scrobble_play_time, should_reauthenticate,
-        Retry,
+        MetadataItem, PendingScrobble, PlaybackSnapshot, PlayerState, QueuePolicy, Retry,
+        TrackInfo, apply_direct_playback_snapshot, apply_metadata_item, apply_queue_retention,
+        decode_duration_ms, delete_queued_scrobbles, enqueue_scrobble, hex_to_fourcc,
+        increment_retry_count_for_queued_scrobbles, init_queue, is_playing_status,
+        is_retriable_scrobble_error, is_truthy_flag, maybe_ready_for_scrobble,
+        move_queued_scrobbles_to_dead_letter, parse_xml_item, pop_queued_scrobbles,
+        queue_has_items, required_scrobble_play_time, send_now_playing, should_reauthenticate,
     };
+    use rusqlite::params;
     use std::time::{Duration, Instant};
+    use tokio::sync::watch;
+
+    fn queue_policy_for_tests() -> QueuePolicy {
+        QueuePolicy {
+            busy_timeout: Duration::from_secs(5),
+            queue_ttl: Duration::from_secs(120),
+            dead_letter_ttl: Duration::from_secs(120),
+            max_queue_items: 100,
+            max_retry_count: 3,
+        }
+    }
 
     fn extract_items(input: &str) -> Vec<&str> {
         let mut items = Vec::new();
@@ -1194,11 +1546,9 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_xml_metadata_items() {
-        let err = parse_xml_item(
-            "<item><type>636f7265</type><code>6d696e6d</code>",
-        )
-        .err()
-        .expect("unclosed metadata item should be rejected");
+        let err = parse_xml_item("<item><type>636f7265</type><code>6d696e6d</code>")
+            .err()
+            .expect("unclosed metadata item should be rejected");
 
         assert!(err.contains("closing </item>"));
     }
@@ -1256,7 +1606,10 @@ mod tests {
 
     #[test]
     fn applies_lastfm_scrobble_threshold_rules() {
-        assert_eq!(required_scrobble_play_time(Some(Duration::from_secs(30))), None);
+        assert_eq!(
+            required_scrobble_play_time(Some(Duration::from_secs(30))),
+            None
+        );
         assert_eq!(
             required_scrobble_play_time(Some(Duration::from_secs(60))),
             Some(Duration::from_secs(30))
@@ -1273,7 +1626,8 @@ mod tests {
 
     #[test]
     fn queue_helpers_keep_fifo_order_and_limit() {
-        let mut conn = init_queue(":memory:").expect("queue init should work");
+        let mut conn =
+            init_queue(":memory:", queue_policy_for_tests()).expect("queue init should work");
         assert!(!queue_has_items(&conn).expect("queue check should work"));
 
         for idx in 0..3 {
@@ -1283,8 +1637,7 @@ mod tests {
                 album: "Album".to_string(),
                 played_at_unix: 1_000 + idx as u64,
             };
-            enqueue_failed_scrobble(&mut conn, &pending, "err")
-                .expect("enqueue should work");
+            enqueue_scrobble(&mut conn, &pending, Some("err")).expect("enqueue should work");
         }
 
         assert!(queue_has_items(&conn).expect("queue check should work"));
@@ -1296,6 +1649,149 @@ mod tests {
         let all = pop_queued_scrobbles(&mut conn, 50).expect("pop should work");
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].title, "Track-2");
+    }
+
+    #[test]
+    fn newly_queued_scrobbles_are_durable_before_retry_metadata_exists() {
+        let mut conn =
+            init_queue(":memory:", queue_policy_for_tests()).expect("queue init should work");
+        let pending = PendingScrobble {
+            artist: "Artist".to_string(),
+            title: "Track".to_string(),
+            album: "Album".to_string(),
+            played_at_unix: 1_700_000_000,
+        };
+
+        enqueue_scrobble(&mut conn, &pending, None).expect("enqueue should work");
+
+        let queued = pop_queued_scrobbles(&mut conn, 1).expect("queue read should work");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].title, pending.title);
+        let (retry_count, last_error): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT retry_count, last_error FROM scrobble_queue WHERE id = ?1",
+                [queued[0].id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("queued row should remain persisted");
+        assert_eq!(retry_count, 0);
+        assert_eq!(last_error, None);
+    }
+
+    #[test]
+    fn dead_letter_move_removes_rows_from_queue() {
+        let mut conn =
+            init_queue(":memory:", queue_policy_for_tests()).expect("queue init should work");
+        let pending = PendingScrobble {
+            artist: "Artist".to_string(),
+            title: "Track".to_string(),
+            album: "Album".to_string(),
+            played_at_unix: 1_700_000_000,
+        };
+
+        enqueue_scrobble(&mut conn, &pending, Some("initial")).expect("enqueue should work");
+        let queued = pop_queued_scrobbles(&mut conn, 10).expect("queue read should work");
+        move_queued_scrobbles_to_dead_letter(
+            &mut conn,
+            &queued,
+            "non_retriable_failure",
+            Some("fatal"),
+        )
+        .expect("dead letter move should work");
+
+        assert!(!queue_has_items(&conn).expect("queue should be empty"));
+        let moved_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM dead_letter_scrobbles", [], |row| {
+                row.get(0)
+            })
+            .expect("dead letter count query should work");
+        assert_eq!(moved_count, 1);
+    }
+
+    #[test]
+    fn queue_retention_applies_ttl_capacity_and_dead_letter_ttl() {
+        let mut conn =
+            init_queue(":memory:", queue_policy_for_tests()).expect("queue init should work");
+        let now = super::current_unix_timestamp() as i64;
+        let old_created = now - 1_000;
+        let recent_created = now - 5;
+
+        conn.execute(
+            "INSERT INTO scrobble_queue
+                (artist, title, album, played_at_unix, retry_count, last_error, created_at_unix)
+             VALUES
+                ('a','old','x',1,0,NULL,?1),
+                ('a','new-1','x',2,0,NULL,?2),
+                ('a','new-2','x',3,0,NULL,?2),
+                ('a','new-3','x',4,0,NULL,?2)",
+            params![old_created, recent_created],
+        )
+        .expect("seed queue rows should work");
+        conn.execute(
+            "INSERT INTO dead_letter_scrobbles
+                (queue_row_id, artist, title, album, played_at_unix, retry_count, last_error, created_at_unix, dead_letter_reason, dead_lettered_at_unix)
+             VALUES
+                (NULL,'d','old-dead','x',1,0,NULL,?1,'expired_ttl',?2)",
+            params![old_created, old_created],
+        )
+        .expect("seed dead letter row should work");
+
+        let policy = QueuePolicy {
+            busy_timeout: Duration::from_secs(5),
+            queue_ttl: Duration::from_secs(60),
+            dead_letter_ttl: Duration::from_secs(60),
+            max_queue_items: 2,
+            max_retry_count: 3,
+        };
+        apply_queue_retention(&mut conn, &policy).expect("queue retention should work");
+
+        let remaining_queue_titles = {
+            let mut stmt = conn
+                .prepare("SELECT title FROM scrobble_queue ORDER BY id ASC")
+                .expect("prepare should work");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("query should work")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect should work")
+        };
+        assert_eq!(
+            remaining_queue_titles,
+            vec!["new-2".to_string(), "new-3".to_string()]
+        );
+
+        let dead_letter_titles = {
+            let mut stmt = conn
+                .prepare("SELECT title FROM dead_letter_scrobbles ORDER BY id ASC")
+                .expect("prepare should work");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("query should work")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect should work")
+        };
+        assert_eq!(
+            dead_letter_titles,
+            vec!["old".to_string(), "new-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn now_playing_channel_keeps_the_latest_update() {
+        let (sender, mut receiver) = watch::channel(None);
+        let first = TrackInfo {
+            title: "First".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+        let latest = TrackInfo {
+            title: "Latest".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+
+        send_now_playing(Some(&sender), &first);
+        send_now_playing(Some(&sender), &latest);
+
+        assert_eq!(receiver.borrow_and_update().as_ref(), Some(&latest));
     }
 
     #[test]
@@ -1385,7 +1881,8 @@ mod tests {
 
     #[test]
     fn retry_queue_helpers_increment_and_delete_rows() {
-        let mut conn = init_queue(":memory:").expect("queue init should work");
+        let mut conn =
+            init_queue(":memory:", queue_policy_for_tests()).expect("queue init should work");
 
         for idx in 0..2 {
             let pending = PendingScrobble {
@@ -1394,8 +1891,7 @@ mod tests {
                 album: "Album".to_string(),
                 played_at_unix: 1_000 + idx as u64,
             };
-            enqueue_failed_scrobble(&mut conn, &pending, "initial")
-                .expect("enqueue should work");
+            enqueue_scrobble(&mut conn, &pending, Some("initial")).expect("enqueue should work");
         }
 
         let queued = pop_queued_scrobbles(&mut conn, 50).expect("read should work");

@@ -23,8 +23,15 @@ For local/offline preparation without real Last.fm credentials, set
 metadata, but skips Last.fm authentication and API calls.
 
 Failed scrobbles are queued in SQLite for retries. By default the queue
-database is `/var/lib/lastfm-scrobbler/scrobble-queue.sqlite3`. Override via
+database is `/var/lib/shairport-scrobbler/scrobble-queue.sqlite3`. Override via
 `LASTFM_QUEUE_DB` if needed.
+Queue hardening defaults:
+- SQLite `journal_mode=WAL` (for file-backed DBs)
+- SQLite busy timeout: `LASTFM_QUEUE_BUSY_TIMEOUT_MS` (default `5000`)
+- Queue TTL: `LASTFM_QUEUE_TTL_SECS` (default `604800`, 7 days)
+- Queue max rows: `LASTFM_QUEUE_MAX_ITEMS` (default `10000`)
+- Max retries per queued row: `LASTFM_QUEUE_MAX_RETRIES` (default `20`)
+- Dead-letter TTL: `LASTFM_DEAD_LETTER_TTL_SECS` (default `2592000`, 30 days)
 
 Logging uses standard Rust log levels (`error`, `warn`, `info`, `debug`,
 `trace`) and is controlled with `RUST_LOG` (default level is `info`).
@@ -354,7 +361,7 @@ Environment="LASTFM_PASSWORD=your_password"
 # Optional for local testing without Last.fm credentials/API calls.
 # Environment="LASTFM_OFFLINE_MODE=1"
 # Optional SQLite path for failed scrobble retry queue.
-# Environment="LASTFM_QUEUE_DB=/var/lib/lastfm-scrobbler/scrobble-queue.sqlite3"
+# Environment="LASTFM_QUEUE_DB=/var/lib/shairport-scrobbler/scrobble-queue.sqlite3"
 # Optional; defaults to /tmp/shairport-sync-metadata.
 # Environment="SHAIRPORT_PIPE=/path/to/shairport-sync-metadata"
 # Optional DBus backend overrides.
@@ -506,6 +513,62 @@ Manual admin decrypt example:
 sudo systemd-creds decrypt /etc/credstore.encrypted/lastfm_api_key -
 ```
 
+## Runtime flow
+
+The service uses two concurrent paths:
+- **Input loop (sync):** reads metadata (`pipe`/`dbus`/`mpris`) and updates
+  local playback state.
+- **Last.fm worker (async):** receives coalesced now-playing updates and handles
+  scrobble send/retry logic.
+
+### Sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant Input as Input backend loop
+    participant State as PlayerState
+    participant Worker as Async Last.fm worker
+    participant Lastfm as Last.fm API
+    participant Queue as SQLite queue
+
+    Input->>State: Apply metadata snapshot/item
+    Input->>Worker: send latest now-playing (watch channel)
+    Worker->>Lastfm: now_playing(track)
+    Lastfm-->>Worker: accepted/rejected
+
+    loop every 1s
+      Worker->>State: maybe_ready_for_scrobble()
+      alt threshold not yet met
+        Worker->>Queue: every 15s, retry queued batch (if any)
+      else threshold met
+        Worker->>Lastfm: scrobble(single play)
+        alt accepted
+          Worker-->>Worker: done
+        else retriable failure
+          Worker->>Queue: enqueue as fallback
+          Worker->>Queue: retention/cap enforcement
+        else non-retriable failure
+          Worker-->>Worker: drop (log warning)
+        end
+      end
+    end
+```
+
+### Scrobble state diagram
+
+```mermaid
+stateDiagram-v2
+    [*] --> Tracking
+    Tracking --> Eligible: Last.fm threshold reached
+    Eligible --> Sent: direct scrobble accepted
+    Eligible --> QueuedFallback: retriable send error
+    Eligible --> Dropped: non-retriable send error
+    QueuedFallback --> Sent: queued retry accepted
+    QueuedFallback --> QueuedFallback: retryable queued failure
+    QueuedFallback --> DeadLettered: non-retriable, ttl, capacity, or max-retries
+    DeadLettered --> Purged: dead-letter TTL reached
+```
+
 ## Behavior
 
 - Reads metadata from exactly one selected backend: `pipe`, `dbus`, or
@@ -523,13 +586,21 @@ sudo systemd-creds decrypt /etc/credstore.encrypted/lastfm_api_key -
     4 minutes, whichever comes first
   - if duration metadata is missing, falls back to a 30-second threshold
   - only active playback time counts toward the threshold (paused time does not)
-- Failed scrobble submissions are stored in a local SQLite queue and retried
-  periodically in batches (up to 50 tracks per request).
-- Cached queued scrobbles are retried before new scrobble submissions.
+- Scrobbles are sent to Last.fm immediately once threshold conditions are met.
+- Failed **retriable** scrobble submissions are stored in a local SQLite queue
+  as a fallback and retried periodically in batches (up to 50 tracks per
+  request).
+- Queue hardening is enabled:
+  - file-backed SQLite queue uses WAL mode
+  - DB operations use a configurable busy timeout
+  - queue rows older than the configured queue TTL are moved to dead letter
+  - queue size is bounded; oldest overflow rows are moved to dead letter
+  - queued rows that exceed max retries are moved to dead letter
+  - dead-letter rows are purged after the configured dead-letter TTL
 - Retry handling is error-classified:
   - temporary service/network failures are retried
   - invalid session errors trigger re-authentication and retry
-  - non-retriable request errors are dropped from the retry queue
+  - non-retriable queued request failures are moved to dead letter
 - Retries opening the metadata pipe every three seconds if it is unavailable.
 
 If Spotify is also linked to Last.fm and streamed to the Pi over AirPlay,
