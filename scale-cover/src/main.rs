@@ -1,11 +1,11 @@
 use env_logger::{Builder, Env, Target};
+use image::imageops::FilterType;
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+use log::{debug, error, info, warn};
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
-use image::imageops::FilterType;
-use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
-use log::{debug, error, info, warn};
 use zune_jpeg::{
     JpegDecoder,
     zune_core::{bytestream::ZCursor, colorspace::ColorSpace},
@@ -61,8 +61,7 @@ fn process_cover(input_path: &str, output_path: &str) -> Result<(), String> {
     if width < 1000 || height < 1000 {
         return Err(format!(
             "Origin image '{}' must be at least 1000x1000 (got {}x{}).",
-            input_path,
-            width, height
+            input_path, width, height
         ));
     }
 
@@ -316,8 +315,14 @@ mod tests {
         );
 
         assert!(result.is_err(), "rename to directory should fail");
-        assert!(output_target.is_dir(), "output target directory should remain");
-        assert!(!output_tmp.exists(), "temporary output file should be removed");
+        assert!(
+            output_target.is_dir(),
+            "output target directory should remain"
+        );
+        assert!(
+            !output_tmp.exists(),
+            "temporary output file should be removed"
+        );
         assert!(input.exists(), "folder.jpg should still exist");
 
         fs::remove_dir_all(dir).expect("failed to clean test directory");

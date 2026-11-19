@@ -10,9 +10,11 @@ use rusqlite::{Connection as SqliteConnection, params};
 use scrobl::client::{Play, Writer};
 use scrobl::{ApiKey, ApiSecret, Password, Retry};
 use std::cmp;
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -51,14 +53,40 @@ enum InputBackend {
     Pipe,
     Dbus,
     Mpris,
+    Auto,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ShairportBackend {
+    Pipe,
+    Dbus,
+    Mpris,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SourceKind {
+    Shairport,
+    Mpd,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct PlaybackSnapshot {
     title: String,
     artist: String,
     album: String,
     duration: Option<Duration>,
     is_playing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SourceEvent {
+    source: SourceKind,
+    snapshot: PlaybackSnapshot,
+}
+
+struct SourceArbiter {
+    active_source: Option<SourceKind>,
+    latest: HashMap<SourceKind, PlaybackSnapshot>,
 }
 
 #[derive(Clone)]
@@ -245,6 +273,40 @@ impl Default for PlayerState {
     }
 }
 
+impl SourceArbiter {
+    fn new() -> Self {
+        Self {
+            active_source: None,
+            latest: HashMap::new(),
+        }
+    }
+
+    fn ingest(&mut self, event: &SourceEvent) -> bool {
+        self.latest.insert(event.source, event.snapshot.clone());
+        self.active_source = self.choose_active_source();
+        self.active_source == Some(event.source)
+    }
+
+    fn choose_active_source(&self) -> Option<SourceKind> {
+        if let Some(active_source) = self.active_source
+            && self
+                .latest
+                .get(&active_source)
+                .is_some_and(is_source_snapshot_active)
+        {
+            return Some(active_source);
+        }
+
+        [SourceKind::Shairport, SourceKind::Mpd]
+            .into_iter()
+            .find(|source| {
+                self.latest
+                    .get(source)
+                    .is_some_and(is_source_snapshot_active)
+            })
+    }
+}
+
 fn init_logging() {
     Builder::from_env(Env::default().default_filter_or("info"))
         .target(Target::Stdout)
@@ -346,12 +408,36 @@ fn main() {
         .expect("Last.fm worker stopped before startup")
         .unwrap_or_else(|err| panic!("Last.fm authentication failed: {}", err));
     let now_playing = (!offline_mode).then_some(&now_playing_tx);
+    let (source_tx, source_rx) = mpsc::channel::<SourceEvent>();
 
     match input_backend {
-        InputBackend::Pipe => run_pipe_input_loop(&pipe_path, &state, now_playing),
-        InputBackend::Dbus => run_native_dbus_input_loop(&state, now_playing),
-        InputBackend::Mpris => run_mpris_input_loop(&state, now_playing),
+        InputBackend::Pipe => spawn_pipe_worker(pipe_path, source_tx, SourceKind::Shairport),
+        InputBackend::Dbus => spawn_native_dbus_worker(source_tx, SourceKind::Shairport),
+        InputBackend::Mpris => spawn_mpris_worker(source_tx, SourceKind::Shairport),
+        InputBackend::Auto => {
+            let shairport_backend = parse_auto_shairport_backend();
+            info!(
+                "Auto input mode enabled. Shairport backend={}, MPD idle-events enabled.",
+                match shairport_backend {
+                    ShairportBackend::Pipe => "pipe",
+                    ShairportBackend::Dbus => "dbus",
+                    ShairportBackend::Mpris => "mpris",
+                }
+            );
+            spawn_mpd_worker(source_tx.clone(), SourceKind::Mpd);
+            match shairport_backend {
+                ShairportBackend::Pipe => {
+                    spawn_pipe_worker(pipe_path, source_tx, SourceKind::Shairport)
+                }
+                ShairportBackend::Dbus => {
+                    spawn_native_dbus_worker(source_tx, SourceKind::Shairport)
+                }
+                ShairportBackend::Mpris => spawn_mpris_worker(source_tx, SourceKind::Shairport),
+            }
+        }
     }
+
+    run_source_event_loop(source_rx, &state, now_playing);
 }
 
 async fn run_lastfm_worker(
@@ -572,21 +658,68 @@ fn parse_input_backend() -> InputBackend {
         "pipe" => InputBackend::Pipe,
         "dbus" => InputBackend::Dbus,
         "mpris" => InputBackend::Mpris,
+        "auto" => InputBackend::Auto,
         other => panic!(
-            "Unsupported LASTFM_INPUT_BACKEND value: {}. Use one of: pipe, dbus, mpris.",
+            "Unsupported LASTFM_INPUT_BACKEND value: {}. Use one of: pipe, dbus, mpris, auto.",
             other
         ),
     }
 }
 
-fn run_pipe_input_loop(
-    pipe_path: &str,
+fn parse_auto_shairport_backend() -> ShairportBackend {
+    let backend = env::var("LASTFM_AUTO_SHAIRPORT_BACKEND").unwrap_or_else(|_| "pipe".to_string());
+    match backend.trim().to_ascii_lowercase().as_str() {
+        "pipe" => ShairportBackend::Pipe,
+        "dbus" => ShairportBackend::Dbus,
+        "mpris" => ShairportBackend::Mpris,
+        other => panic!(
+            "Unsupported LASTFM_AUTO_SHAIRPORT_BACKEND value: {}. Use one of: pipe, dbus, mpris.",
+            other
+        ),
+    }
+}
+
+fn run_source_event_loop(
+    source_rx: mpsc::Receiver<SourceEvent>,
     state: &Arc<Mutex<PlayerState>>,
     now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
 ) -> ! {
+    let mut arbiter = SourceArbiter::new();
+    loop {
+        match source_rx.recv() {
+            Ok(event) => {
+                let was_active = arbiter.active_source;
+                let is_active_event = arbiter.ingest(&event);
+                let is_last_event_from_previous_active =
+                    was_active == Some(event.source) && arbiter.active_source.is_none();
+                if was_active != arbiter.active_source
+                    && let Some(active_source) = arbiter.active_source
+                {
+                    info!("Active playback source switched to {:?}", active_source);
+                }
+                if is_active_event || is_last_event_from_previous_active {
+                    apply_playback_snapshot(&event.snapshot, state, now_playing);
+                }
+            }
+            Err(err) => panic!("All source workers exited unexpectedly: {}", err),
+        }
+    }
+}
+
+fn spawn_pipe_worker(pipe_path: String, source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) {
+    thread::spawn(move || run_pipe_worker_loop(pipe_path, source_tx, source));
+}
+
+fn run_pipe_worker_loop(
+    pipe_path: String,
+    source_tx: mpsc::Sender<SourceEvent>,
+    source: SourceKind,
+) -> ! {
+    let mut worker_state = PlayerState::default();
+    let mut last_snapshot = None;
     loop {
         debug!("Opening pipe: {}", pipe_path);
-        let file = match File::open(pipe_path) {
+        let file = match File::open(&pipe_path) {
             Ok(f) => f,
             Err(e) => {
                 warn!("Waiting for pipe ({}): {}", pipe_path, e);
@@ -606,7 +739,9 @@ fn run_pipe_input_loop(
             item_buffer.push_str(&line);
 
             if line.trim_end().ends_with("</item>") {
-                process_xml_item(&item_buffer, state, now_playing);
+                process_xml_item(&item_buffer, &mut worker_state);
+                let snapshot = snapshot_from_player_state(&worker_state);
+                emit_snapshot_if_changed(source, &snapshot, &source_tx, &mut last_snapshot);
                 item_buffer.clear();
             }
             line.clear();
@@ -614,10 +749,11 @@ fn run_pipe_input_loop(
     }
 }
 
-fn run_mpris_input_loop(
-    state: &Arc<Mutex<PlayerState>>,
-    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
-) -> ! {
+fn spawn_mpris_worker(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) {
+    thread::spawn(move || run_mpris_worker_loop(source_tx, source));
+}
+
+fn run_mpris_worker_loop(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) -> ! {
     let bus = env::var("MPRIS_BUS").unwrap_or_else(|_| "system".to_string());
     let nametag = env::var("SHAIRPORT_DBUS_NAMETAG").ok();
     let default_service = match nametag {
@@ -634,20 +770,24 @@ fn run_mpris_input_loop(
         "Using MPRIS backend on {} bus: service={}, path={}",
         bus, service, path
     );
+    let mut last_snapshot = None;
 
     loop {
         match read_mpris_snapshot(&conn, &service, &path) {
-            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, now_playing),
+            Ok(snapshot) => {
+                emit_snapshot_if_changed(source, &snapshot, &source_tx, &mut last_snapshot)
+            }
             Err(err) => warn!("MPRIS read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn run_native_dbus_input_loop(
-    state: &Arc<Mutex<PlayerState>>,
-    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
-) -> ! {
+fn spawn_native_dbus_worker(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) {
+    thread::spawn(move || run_native_dbus_worker_loop(source_tx, source));
+}
+
+fn run_native_dbus_worker_loop(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) -> ! {
     let bus = env::var("SHAIRPORT_DBUS_BUS").unwrap_or_else(|_| "system".to_string());
     let nametag = env::var("SHAIRPORT_DBUS_NAMETAG").ok();
     let default_service = match nametag {
@@ -663,14 +803,213 @@ fn run_native_dbus_input_loop(
         "Using native DBus backend on {} bus: service={}, path={}",
         bus, service, path
     );
+    let mut last_snapshot = None;
 
     loop {
         match read_native_dbus_snapshot(&conn, &service, &path) {
-            Ok(snapshot) => apply_playback_snapshot(&snapshot, state, now_playing),
+            Ok(snapshot) => {
+                emit_snapshot_if_changed(source, &snapshot, &source_tx, &mut last_snapshot)
+            }
             Err(err) => warn!("DBus read error: {}", err),
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn spawn_mpd_worker(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) {
+    thread::spawn(move || run_mpd_worker_loop(source_tx, source));
+}
+
+fn run_mpd_worker_loop(source_tx: mpsc::Sender<SourceEvent>, source: SourceKind) -> ! {
+    let host = env::var("MPD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var("MPD_PORT")
+        .unwrap_or_else(|_| "6600".to_string())
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("MPD_PORT must be a valid TCP port"));
+
+    let mut last_snapshot = None;
+    loop {
+        match connect_mpd_session(&host, port) {
+            Ok((mut writer, mut reader)) => {
+                info!("Connected to MPD at {}:{}", host, port);
+                if let Some(password) = env::var("MPD_PASSWORD").ok()
+                    && let Err(err) = mpd_send_command(
+                        &mut writer,
+                        &mut reader,
+                        &format!("password {}", password),
+                    )
+                {
+                    warn!("MPD password authentication failed: {}", err);
+                    thread::sleep(Duration::from_secs(3));
+                    continue;
+                }
+                if let Err(err) = poll_mpd_events(
+                    &mut writer,
+                    &mut reader,
+                    source,
+                    &source_tx,
+                    &mut last_snapshot,
+                ) {
+                    warn!("MPD event loop error: {}", err);
+                    thread::sleep(Duration::from_secs(2));
+                }
+            }
+            Err(err) => {
+                warn!("Waiting for MPD at {}:{}: {}", host, port, err);
+                thread::sleep(Duration::from_secs(3));
+            }
+        }
+    }
+}
+
+fn connect_mpd_session(host: &str, port: u16) -> Result<(TcpStream, BufReader<TcpStream>), String> {
+    let stream = TcpStream::connect((host, port)).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|err| err.to_string())?;
+    let reader_stream = stream.try_clone().map_err(|err| err.to_string())?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut greeting = String::new();
+    reader
+        .read_line(&mut greeting)
+        .map_err(|err| err.to_string())?;
+    if !greeting.starts_with("OK MPD") {
+        return Err(format!("unexpected MPD greeting: {}", greeting.trim_end()));
+    }
+    stream.set_read_timeout(None).map_err(|err| err.to_string())?;
+    reader
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(|err| err.to_string())?;
+    Ok((stream, reader))
+}
+
+fn poll_mpd_events(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    source: SourceKind,
+    source_tx: &mpsc::Sender<SourceEvent>,
+    last_snapshot: &mut Option<PlaybackSnapshot>,
+) -> Result<(), String> {
+    let initial_snapshot = read_mpd_snapshot(writer, reader)?;
+    emit_snapshot_if_changed(source, &initial_snapshot, source_tx, last_snapshot);
+
+    loop {
+        let events = mpd_send_command(writer, reader, "idle player")?;
+        if !events.iter().any(|line| line == "changed: player") {
+            continue;
+        }
+        let snapshot = read_mpd_snapshot(writer, reader)?;
+        emit_snapshot_if_changed(source, &snapshot, source_tx, last_snapshot);
+    }
+}
+
+fn read_mpd_snapshot(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+) -> Result<PlaybackSnapshot, String> {
+    let status_lines = mpd_send_command(writer, reader, "status")?;
+    let song_lines = mpd_send_command(writer, reader, "currentsong")?;
+
+    let mut is_playing = false;
+    for line in status_lines {
+        if let Some(value) = line.strip_prefix("state:") {
+            is_playing = value.trim().eq_ignore_ascii_case("play");
+        }
+    }
+
+    let mut title = String::new();
+    let mut artist = String::new();
+    let mut album = String::new();
+    let mut duration = None;
+
+    for line in song_lines {
+        if let Some(value) = line.strip_prefix("Title:") {
+            title = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("Artist:") {
+            artist = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("Album:") {
+            album = value.trim().to_string();
+        } else if let Some(value) = line.strip_prefix("duration:") {
+            if let Ok(seconds) = value.trim().parse::<f64>()
+                && seconds.is_finite()
+                && seconds > 0.0
+            {
+                duration = Some(Duration::from_millis((seconds * 1000.0) as u64));
+            }
+        } else if let Some(value) = line.strip_prefix("Time:")
+            && duration.is_none()
+            && let Ok(seconds) = value.trim().parse::<u64>()
+        {
+            duration = Some(Duration::from_secs(seconds));
+        }
+    }
+
+    Ok(PlaybackSnapshot {
+        title,
+        artist,
+        album,
+        duration,
+        is_playing,
+    })
+}
+
+fn mpd_send_command(
+    writer: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    command: &str,
+) -> Result<Vec<String>, String> {
+    writer
+        .write_all(command.as_bytes())
+        .map_err(|err| err.to_string())?;
+    writer.write_all(b"\n").map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())?;
+    mpd_read_response(reader)
+}
+
+fn mpd_read_response(reader: &mut BufReader<TcpStream>) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        if bytes == 0 {
+            return Err("MPD closed the connection".to_string());
+        }
+        let trimmed = line.trim_end().to_string();
+        if trimmed == "OK" {
+            return Ok(lines);
+        }
+        if trimmed.starts_with("ACK ") {
+            return Err(trimmed);
+        }
+        lines.push(trimmed);
+    }
+}
+
+fn emit_snapshot_if_changed(
+    source: SourceKind,
+    snapshot: &PlaybackSnapshot,
+    source_tx: &mpsc::Sender<SourceEvent>,
+    last_snapshot: &mut Option<PlaybackSnapshot>,
+) {
+    if last_snapshot.as_ref() == Some(snapshot) {
+        return;
+    }
+
+    *last_snapshot = Some(snapshot.clone());
+    if let Err(err) = source_tx.send(SourceEvent {
+        source,
+        snapshot: snapshot.clone(),
+    }) {
+        panic!("Failed to send source event: {}", err);
+    }
+}
+
+fn is_source_snapshot_active(snapshot: &PlaybackSnapshot) -> bool {
+    snapshot.is_playing && !snapshot.artist.is_empty() && !snapshot.title.is_empty()
 }
 
 fn open_dbus_connection(bus: &str) -> DbusConnection {
@@ -749,11 +1088,7 @@ fn apply_playback_snapshot(
     }
 }
 
-fn process_xml_item(
-    xml: &str,
-    state: &Arc<Mutex<PlayerState>>,
-    now_playing: Option<&watch::Sender<Option<TrackInfo>>>,
-) {
+fn process_xml_item(xml: &str, state: &mut PlayerState) {
     let item = match parse_xml_item(xml) {
         Ok(item) => item,
         Err(err) => {
@@ -762,13 +1097,16 @@ fn process_xml_item(
         }
     };
 
-    let mut st = state.lock().unwrap();
-    if apply_metadata_item(&item, &mut st) {
-        info!(
-            "Now Playing: {} - {} ({})",
-            st.current.artist, st.current.title, st.current.album
-        );
-        send_now_playing(now_playing, &st.current);
+    apply_metadata_item(&item, state);
+}
+
+fn snapshot_from_player_state(st: &PlayerState) -> PlaybackSnapshot {
+    PlaybackSnapshot {
+        title: st.current.title.clone(),
+        artist: st.current.artist.clone(),
+        album: st.current.album.clone(),
+        duration: st.current_duration,
+        is_playing: st.is_playing,
     }
 }
 
@@ -1484,14 +1822,16 @@ async fn retry_queued_scrobbles(
 mod tests {
     use super::{
         MetadataItem, PendingScrobble, PlaybackSnapshot, PlayerState, QueuePolicy, Retry,
-        TrackInfo, apply_direct_playback_snapshot, apply_metadata_item, apply_queue_retention,
-        decode_duration_ms, delete_queued_scrobbles, enqueue_scrobble, hex_to_fourcc,
+        SourceArbiter, SourceEvent, SourceKind, TrackInfo, apply_direct_playback_snapshot,
+        apply_metadata_item, apply_playback_snapshot, apply_queue_retention, decode_duration_ms,
+        delete_queued_scrobbles, enqueue_scrobble, hex_to_fourcc,
         increment_retry_count_for_queued_scrobbles, init_queue, is_playing_status,
         is_retriable_scrobble_error, is_truthy_flag, maybe_ready_for_scrobble,
         move_queued_scrobbles_to_dead_letter, parse_xml_item, pop_queued_scrobbles,
         queue_has_items, required_scrobble_play_time, send_now_playing, should_reauthenticate,
     };
     use rusqlite::params;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::watch;
 
@@ -1792,6 +2132,110 @@ mod tests {
         send_now_playing(Some(&sender), &latest);
 
         assert_eq!(receiver.borrow_and_update().as_ref(), Some(&latest));
+    }
+
+    #[test]
+    fn source_arbiter_keeps_active_source_until_it_stops() {
+        let mut arbiter = SourceArbiter::new();
+        let shairport_playing = PlaybackSnapshot {
+            title: "A".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration: Some(Duration::from_secs(120)),
+            is_playing: true,
+        };
+        let mpd_playing = PlaybackSnapshot {
+            title: "B".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration: Some(Duration::from_secs(90)),
+            is_playing: true,
+        };
+
+        assert!(arbiter.ingest(&SourceEvent {
+            source: SourceKind::Shairport,
+            snapshot: shairport_playing.clone(),
+        }));
+        assert_eq!(arbiter.active_source, Some(SourceKind::Shairport));
+        assert!(!arbiter.ingest(&SourceEvent {
+            source: SourceKind::Mpd,
+            snapshot: mpd_playing.clone(),
+        }));
+        assert_eq!(arbiter.active_source, Some(SourceKind::Shairport));
+
+        assert!(!arbiter.ingest(&SourceEvent {
+            source: SourceKind::Shairport,
+            snapshot: PlaybackSnapshot {
+                is_playing: false,
+                ..shairport_playing
+            },
+        }));
+        assert_eq!(arbiter.active_source, Some(SourceKind::Mpd));
+        assert!(arbiter.ingest(&SourceEvent {
+            source: SourceKind::Mpd,
+            snapshot: mpd_playing,
+        }));
+    }
+
+    #[test]
+    fn source_switch_with_same_track_does_not_emit_duplicate_now_playing() {
+        let state = Arc::new(Mutex::new(PlayerState::default()));
+        let (sender, mut receiver) = watch::channel(None);
+        let mut arbiter = SourceArbiter::new();
+
+        let shared_track = PlaybackSnapshot {
+            title: "Song".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            duration: Some(Duration::from_secs(180)),
+            is_playing: true,
+        };
+
+        let shairport_event = SourceEvent {
+            source: SourceKind::Shairport,
+            snapshot: shared_track.clone(),
+        };
+        if arbiter.ingest(&shairport_event) {
+            apply_playback_snapshot(&shairport_event.snapshot, &state, Some(&sender));
+        }
+        assert_eq!(
+            receiver.borrow_and_update().as_ref().cloned(),
+            Some(TrackInfo {
+                title: "Song".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+            })
+        );
+
+        let shairport_stopped = SourceEvent {
+            source: SourceKind::Shairport,
+            snapshot: PlaybackSnapshot {
+                is_playing: false,
+                ..shared_track.clone()
+            },
+        };
+        let _ = arbiter.ingest(&shairport_stopped);
+
+        let mpd_event = SourceEvent {
+            source: SourceKind::Mpd,
+            snapshot: shared_track.clone(),
+        };
+        if arbiter.ingest(&mpd_event) {
+            apply_playback_snapshot(&mpd_event.snapshot, &state, Some(&sender));
+        }
+        assert!(
+            !receiver
+                .has_changed()
+                .expect("watch channel should be open")
+        );
+        assert_eq!(
+            state.lock().expect("state lock should succeed").current,
+            TrackInfo {
+                title: "Song".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+            }
+        );
     }
 
     #[test]

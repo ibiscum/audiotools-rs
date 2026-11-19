@@ -1,6 +1,6 @@
-# maintain_album_art
+# maintain-album-art
 
-`maintain_album_art` scans a directory tree for `.flac` and `.mp3`
+`maintain-album-art` scans a directory tree for `.flac` and `.mp3`
 music files and audits album-art completeness at both track and directory
 level.
 
@@ -39,29 +39,25 @@ directory-level checks pass.
 From the workspace root:
 
 ```bash
-cargo run -p maintain_album_art -- <directory-to-scan>
+cargo run -p maintain-album-art -- <directory-to-scan>
 ```
 
 Example:
 
 ```bash
-cargo run -p maintain_album_art -- ~/Music
+cargo run -p maintain-album-art -- ~/Music
 ```
 
 Show help:
 
 ```bash
-cargo run -p maintain_album_art -- --help
+cargo run -p maintain-album-art -- --help
 ```
 
 ## Options
 
-```text
-Usage: maintain_album_art [--skip-complete] <directory-to-scan>
-
-Options:
-  --skip-complete    Omit fully complete directories and suppress OK track lines/counts from summary output
-```
+- `--skip-complete`: omit fully complete directories and suppress OK track
+  lines/counts from summary output.
 
 ## Logging
 
@@ -69,8 +65,8 @@ Logging is structured and leveled (`INFO`, `WARN`, `ERROR`, `DEBUG`, `TRACE`).
 Control verbosity via `RUST_LOG`:
 
 ```bash
-RUST_LOG=debug cargo run -p maintain_album_art -- ~/Music
-RUST_LOG=trace cargo run -p maintain_album_art -- ~/Music
+RUST_LOG=debug cargo run -p maintain-album-art -- ~/Music
+RUST_LOG=trace cargo run -p maintain-album-art -- ~/Music
 ```
 
 ## Exit behavior
