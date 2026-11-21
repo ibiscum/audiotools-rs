@@ -6,6 +6,8 @@
 - [maintain-album-art](#maintain-album-art)
 - [scale-cover](#scale-cover)
 - [lastfm-scrobbler](#lastfm-scrobbler)
+- [stream-arbiter](#stream-arbiter)
+- [volume-arbiter](#volume-arbiter)
 
 ## Install
 
@@ -15,6 +17,8 @@ From the workspace root, install each application by path:
 cargo install --path maintain-album-art
 cargo install --path scale-cover
 cargo install --path lastfm-scrobbler
+cargo install --path stream-arbiter
+cargo install --path volume-arbiter
 ```
 
 ## maintain-album-art
@@ -48,3 +52,26 @@ cargo run -p scale-cover
 ## lastfm-scrobbler
 
 See [docs/lastfm-scrobbler.md](docs/lastfm-scrobbler.md) for setup and service instructions.
+
+## stream-arbiter
+
+`stream-arbiter` watches Snapcast stream activity and switches selected groups
+to the highest-priority active source.
+
+Quick run:
+
+```bash
+cargo run -p stream-arbiter
+```
+
+## volume-arbiter
+
+`volume-arbiter` bridges source volume to Snapcast client/group volume:
+MPD volume is read directly from MPD, and AirPlay volume can be read from a
+Shairport-updated file.
+
+Quick run:
+
+```bash
+cargo run -p volume-arbiter
+```
