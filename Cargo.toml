@@ -4,4 +4,6 @@ members = [
     "maintain-album-art",
     "scale-cover",
     "lastfm-scrobbler",
+    "stream-arbiter",
+    "volume-arbiter",
 ]
